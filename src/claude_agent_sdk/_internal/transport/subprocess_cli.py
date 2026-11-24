@@ -64,6 +64,54 @@ def _kill_active_children() -> None:
 atexit.register(_kill_active_children)
 
 
+_WIN_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC"
+
+
+def _absolute_path_dirs() -> list[str]:
+    """PATH entries that name a fixed directory.
+
+    Empty, "." and other relative entries resolve against the process cwd,
+    so a lookup through them finds whatever file sits in the directory the
+    SDK was started from. On Windows Path.is_absolute() also requires a
+    drive, dropping a rooted entry ("\\tools") that resolves against the
+    current drive.
+    """
+    raw = os.environ.get("PATH")
+    if raw is None:
+        raw = os.defpath
+    return [entry for entry in raw.split(os.pathsep) if Path(entry).is_absolute()]
+
+
+def _which_cli(name: str) -> str | None:
+    """Absolute path of ``name`` in an absolute PATH directory, or None.
+
+    On Windows, shutil.which searches the current directory before PATH --
+    always on 3.10 and 3.11, and on 3.12+ unless
+    NoDefaultCurrentDirectoryInExePath is set -- even when given an
+    explicit ``path``. A claude.exe in a cloned repository or extracted
+    archive would then win over the real CLI, so the Windows PATHEXT walk is
+    done here instead.
+    """
+    dirs = _absolute_path_dirs()
+    if not dirs:
+        return None
+    if platform.system() != "Windows":
+        return shutil.which(name, path=os.pathsep.join(dirs))
+
+    pathext_source = os.environ.get("PATHEXT") or _WIN_DEFAULT_PATHEXT
+    pathext = [ext for ext in pathext_source.split(os.pathsep) if ext]
+    if any(name.lower().endswith(ext.lower()) for ext in pathext):
+        candidates = [name]
+    else:
+        candidates = [name + ext for ext in pathext]
+    for directory in dirs:
+        for candidate in candidates:
+            full_path = Path(directory) / candidate
+            if full_path.is_file() and os.access(full_path, os.F_OK | os.X_OK):
+                return str(full_path)
+    return None
+
+
 # Parentheses and commas are delimiters to the --allowedTools tokenizer;
 # control characters (C0, DEL, C1) never appear in a skill directory name.
 # U+FEFF is here rather than with the whitespace check below because the
@@ -257,13 +305,13 @@ class SubprocessCLITransport(Transport):
 
         # Fall back to system-wide search
         which_hit: str | None = None
-        if cli := shutil.which("claude"):
+        if cli := _which_cli("claude"):
             if platform.system() != "Windows" or self._is_windows_native_exe(cli):
                 return cli
             # Windows resolved something CreateProcess cannot run directly
             # as the CLI: npm's claude.cmd shim (which connect() refuses to
             # spawn) or an extensionless wrapper script from a git-bash /
-            # WSL setup (which fails at spawn with WinError 193). shutil.which
+            # WSL setup (which fails at spawn with WinError 193). _which_cli
             # walks PATH directory-major, so such an entry in an early PATH
             # directory shadows a native claude.exe installed in a later
             # one (within one directory the default PATHEXT would prefer
@@ -273,7 +321,7 @@ class SubprocessCLITransport(Transport):
             # explanatory batch-script refusal from connect(). The claude.exe
             # probe is vetted too: PATHEXT resolution can append an
             # extension and hand back "claude.exe.cmd".
-            exe = shutil.which("claude.exe")
+            exe = _which_cli("claude.exe")
             if exe and self._is_windows_native_exe(exe):
                 return exe
             which_hit = cli

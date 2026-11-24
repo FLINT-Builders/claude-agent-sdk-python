@@ -2573,7 +2573,7 @@ class TestWindowsBatchScriptRefusal:
                     SubprocessCLITransport, "_find_bundled_cli", return_value=None
                 ),
                 patch(
-                    "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                    "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                     side_effect=_which,
                 ),
                 patch("pathlib.Path.exists", return_value=False),
@@ -2613,7 +2613,7 @@ class TestWindowsBatchScriptRefusal:
                     SubprocessCLITransport, "_find_bundled_cli", return_value=None
                 ),
                 patch(
-                    "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                    "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                     side_effect=_which,
                 ),
                 patch("pathlib.Path.exists", return_value=False),
@@ -2652,7 +2652,7 @@ class TestWindowsBatchScriptRefusal:
                     SubprocessCLITransport, "_find_bundled_cli", return_value=None
                 ),
                 patch(
-                    "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                    "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                     side_effect=_which,
                 ),
                 patch("pathlib.Path.exists", return_value=False),
@@ -2690,7 +2690,7 @@ class TestWindowsBatchScriptRefusal:
                     SubprocessCLITransport, "_find_bundled_cli", return_value=None
                 ),
                 patch(
-                    "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                    "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                     side_effect=_which,
                 ),
                 patch("pathlib.Path.exists", return_value=False),
@@ -2841,7 +2841,7 @@ class TestWindowsBatchScriptRefusal:
                 SubprocessCLITransport, "_find_bundled_cli", return_value=None
             ),
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                 return_value=None,
             ),
             patch("pathlib.Path.exists", return_value=False),
@@ -2885,7 +2885,7 @@ class TestWindowsBatchScriptRefusal:
                 SubprocessCLITransport, "_find_bundled_cli", return_value=None
             ),
             patch(
-                "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                 return_value=None,
             ),
             patch("pathlib.Path.exists", new=_exists),
@@ -2924,7 +2924,7 @@ class TestWindowsBatchScriptRefusal:
                     SubprocessCLITransport, "_find_bundled_cli", return_value=None
                 ),
                 patch(
-                    "claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                    "claude_agent_sdk._internal.transport.subprocess_cli._which_cli",
                     side_effect=_which,
                 ),
                 patch("pathlib.Path.exists", new=_exists),
