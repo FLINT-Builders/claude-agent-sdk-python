@@ -2003,7 +2003,11 @@ class ClaudeAgentOptions:
     """MCP (Model Context Protocol) server configurations.
 
     Keys are server names, values are server configurations. May also be a path
-    to an MCP config JSON file.
+    to an MCP config JSON file, or an MCP config JSON string.
+
+    The dict and JSON string forms are written to a file readable only by the
+    CLI's user and passed by path, so server ``env`` and ``headers`` values do
+    not appear in the CLI's process arguments.
     """
 
     strict_mcp_config: bool = False
@@ -2097,7 +2101,11 @@ class ClaudeAgentOptions:
 
     These are loaded into the "flag settings" layer, which has the highest
     priority among user-controlled settings. Equivalent to the ``--settings``
-    CLI flag.
+    CLI flag. A settings JSON string is also accepted.
+
+    A path is passed through as-is. A JSON string, or settings merged with
+    :attr:`sandbox`, is written to a file readable only by the CLI's user and
+    passed by path, so its values do not appear in the CLI's process arguments.
     """
 
     add_dirs: list[str | Path] = field(default_factory=list)
@@ -2118,6 +2126,10 @@ class ClaudeAgentOptions:
 
     Keys are argument names (without ``--``), values are argument values. Use
     ``None`` for boolean flags.
+
+    These are passed verbatim as process arguments, which other local users
+    can read. Never put credentials here; use :attr:`env`, :attr:`mcp_servers`
+    or :attr:`settings` instead.
     """
 
     max_buffer_size: int | None = None
