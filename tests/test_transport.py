@@ -4,6 +4,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
@@ -21,6 +22,11 @@ def make_options(**kwargs: object) -> ClaudeAgentOptions:
 
     cli_path = kwargs.pop("cli_path", DEFAULT_CLI_PATH)
     return ClaudeAgentOptions(cli_path=cli_path, **kwargs)
+
+
+def read_config_arg(cmd: list[str], flag: str) -> str:
+    """Return the contents of the private config file passed after ``flag``."""
+    return Path(cmd[cmd.index(flag) + 1]).read_text(encoding="utf-8")
 
 
 class TestSubprocessCLITransport:
@@ -609,7 +615,8 @@ class TestSubprocessCLITransport:
 
         cmd = transport._build_command()
         assert "--settings" in cmd
-        assert settings_json in cmd
+        assert settings_json not in cmd
+        assert read_config_arg(cmd, "--settings") == settings_json
 
     def test_build_command_setting_sources_omitted_when_not_provided(self):
         """Test that --setting-sources is omitted when setting_sources is not provided."""
@@ -1060,13 +1067,8 @@ class TestSubprocessCLITransport:
 
         cmd = transport._build_command()
 
-        # Find the --mcp-config flag and its value
         assert "--mcp-config" in cmd
-        mcp_idx = cmd.index("--mcp-config")
-        mcp_config_value = cmd[mcp_idx + 1]
-
-        # Parse the JSON and verify structure
-        config = json.loads(mcp_config_value)
+        config = json.loads(read_config_arg(cmd, "--mcp-config"))
         assert "mcpServers" in config
         assert config["mcpServers"] == mcp_servers
 
@@ -1109,8 +1111,8 @@ class TestSubprocessCLITransport:
 
         cmd = transport._build_command()
         assert "--mcp-config" in cmd
-        mcp_idx = cmd.index("--mcp-config")
-        assert cmd[mcp_idx + 1] == json_config
+        assert json_config not in cmd
+        assert read_config_arg(cmd, "--mcp-config") == json_config
 
     def test_env_vars_passed_to_subprocess(self):
         """Test that custom environment variables are passed to the subprocess."""
@@ -1770,8 +1772,7 @@ class TestSubprocessCLITransport:
 
         # Should have --settings with sandbox merged in
         assert "--settings" in cmd
-        settings_idx = cmd.index("--settings")
-        settings_value = cmd[settings_idx + 1]
+        settings_value = read_config_arg(cmd, "--settings")
 
         # Parse and verify
         parsed = json.loads(settings_value)
@@ -1808,8 +1809,7 @@ class TestSubprocessCLITransport:
 
         # Should have merged settings
         assert "--settings" in cmd
-        settings_idx = cmd.index("--settings")
-        settings_value = cmd[settings_idx + 1]
+        settings_value = read_config_arg(cmd, "--settings")
 
         parsed = json.loads(settings_value)
 
@@ -1852,8 +1852,7 @@ class TestSubprocessCLITransport:
         cmd = transport._build_command()
 
         assert "--settings" in cmd
-        settings_idx = cmd.index("--settings")
-        settings_value = cmd[settings_idx + 1]
+        settings_value = read_config_arg(cmd, "--settings")
 
         parsed = json.loads(settings_value)
         assert parsed == {"sandbox": {"enabled": True}}
@@ -1881,8 +1880,7 @@ class TestSubprocessCLITransport:
         )
 
         cmd = transport._build_command()
-        settings_idx = cmd.index("--settings")
-        settings_value = cmd[settings_idx + 1]
+        settings_value = read_config_arg(cmd, "--settings")
 
         parsed = json.loads(settings_value)
         network = parsed["sandbox"]["network"]

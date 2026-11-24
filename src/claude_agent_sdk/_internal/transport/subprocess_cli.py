@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import signal
+import tempfile
 from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import suppress
 from pathlib import Path
@@ -62,6 +63,26 @@ def _kill_active_children() -> None:
 
 
 atexit.register(_kill_active_children)
+
+
+# Private directories holding config files handed to the CLI by path (see
+# SubprocessCLITransport._write_private_config). Swept at exit so a transport
+# that was never closed does not leave them behind.
+_PRIVATE_CONFIG_DIRS: set[str] = set()
+
+
+def _remove_private_config_dirs() -> None:
+    for d in list(_PRIVATE_CONFIG_DIRS):
+        shutil.rmtree(d, ignore_errors=True)
+    _PRIVATE_CONFIG_DIRS.clear()
+
+
+atexit.register(_remove_private_config_dirs)
+
+
+def _is_inline_json(value: str) -> bool:
+    """Whether a --settings / --mcp-config value is inline JSON, not a path."""
+    return value.strip().startswith("{")
 
 
 # Parentheses and commas are delimiters to the --allowedTools tokenizer;
@@ -247,6 +268,62 @@ class SubprocessCLITransport(Transport):
             else _DEFAULT_MAX_BUFFER_SIZE
         )
         self._write_lock: anyio.Lock = anyio.Lock()
+        self._config_dir: str | None = None
+
+    def _write_private_config(self, prefix: str, content: str) -> str:
+        """Write CLI config to a file only the CLI's user can read; return its path.
+
+        Process arguments are readable by every local user (/proc/<pid>/cmdline,
+        ps, audit logs), so config that can carry credentials -- MCP server env
+        and headers, settings env -- must reach the CLI by path, never inline.
+        The directory comes from mkdtemp (0700, unpredictable name, created
+        atomically) and the file from mkstemp (0600, O_EXCL), so no other user
+        can pre-create, swap, or read either.
+        """
+        if self._config_dir is None:
+            config_dir = tempfile.mkdtemp(prefix="claude-agent-sdk-")
+            _PRIVATE_CONFIG_DIRS.add(config_dir)
+            self._config_dir = config_dir
+            self._grant_to_cli_user(config_dir)
+        fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json", dir=self._config_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            self._grant_to_cli_user(path)
+        except BaseException:
+            with suppress(OSError):
+                Path(path).unlink()
+            raise
+        return path
+
+    def _grant_to_cli_user(self, path: str) -> None:
+        """Hand a private config path to ``options.user`` when the CLI runs as them.
+
+        Ownership moves to that account instead of widening the mode, so the
+        file stays unreadable to everyone else.
+        """
+        user = self._options.user
+        if user is None or platform.system() == "Windows":
+            return
+        import pwd
+
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+            if uid != os.geteuid():
+                os.chown(path, uid, -1)
+        except (KeyError, OSError) as e:
+            raise CLIConnectionError(
+                f"Failed to start Claude Code: cannot give user {user!r} access "
+                f"to its config file: {e}"
+            ) from e
+
+    def _remove_config_dir(self) -> None:
+        config_dir = self._config_dir
+        if config_dir is None:
+            return
+        self._config_dir = None
+        shutil.rmtree(config_dir, ignore_errors=True)
+        _PRIVATE_CONFIG_DIRS.discard(config_dir)
 
     def _find_cli(self) -> str:
         """Find Claude Code CLI binary."""
@@ -498,7 +575,7 @@ class SubprocessCLITransport(Transport):
                 except json.JSONDecodeError:
                     # If parsing fails, treat as file path
                     logger.warning(
-                        f"Failed to parse settings as JSON, treating as file path: {settings_str}"
+                        "Failed to parse settings as JSON, treating as file path"
                     )
                     # Read the file
                     settings_path = Path(settings_str)
@@ -653,6 +730,8 @@ class SubprocessCLITransport(Transport):
         # Handle settings and sandbox: merge sandbox into settings if both are provided
         settings_value = self._build_settings_value()
         if settings_value:
+            if _is_inline_json(settings_value):
+                settings_value = self._write_private_config("settings-", settings_value)
             cmd.extend(["--settings", settings_value])
 
         if self._options.add_dirs:
@@ -680,12 +759,21 @@ class SubprocessCLITransport(Transport):
                     cmd.extend(
                         [
                             "--mcp-config",
-                            json.dumps({"mcpServers": servers_for_cli}),
+                            self._write_private_config(
+                                "mcp-config-",
+                                json.dumps({"mcpServers": servers_for_cli}),
+                            ),
                         ]
                     )
             else:
-                # String or Path format: pass directly as file path or JSON string
-                cmd.extend(["--mcp-config", str(self._options.mcp_servers)])
+                # String or Path format: a file path is passed through, a JSON
+                # string goes through a private file like the dict form.
+                mcp_config = str(self._options.mcp_servers)
+                if isinstance(self._options.mcp_servers, str) and _is_inline_json(
+                    mcp_config
+                ):
+                    mcp_config = self._write_private_config("mcp-config-", mcp_config)
+                cmd.extend(["--mcp-config", mcp_config])
 
         if self._options.include_partial_messages:
             cmd.append("--include-partial-messages")
@@ -805,7 +893,11 @@ class SubprocessCLITransport(Transport):
         if not os.environ.get("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"):
             await self._check_claude_version()
 
-        cmd = self._build_command()
+        try:
+            cmd = self._build_command()
+        except BaseException:
+            self._remove_config_dir()
+            raise
         try:
             # Merge environment variables. CLAUDE_CODE_ENTRYPOINT defaults to
             # sdk-py regardless of inherited process env; options.env can override
@@ -899,6 +991,9 @@ class SubprocessCLITransport(Transport):
             error = CLIConnectionError(f"Failed to start Claude Code: {e}")
             self._exit_error = error
             raise error from e
+        finally:
+            if self._process is None:
+                self._remove_config_dir()
 
     async def _handle_stderr(self) -> None:
         """Handle stderr stream - read and invoke callbacks."""
@@ -975,6 +1070,7 @@ class SubprocessCLITransport(Transport):
         """
         if not self._process:
             self._ready = False
+            self._remove_config_dir()
             return
 
         with anyio.CancelScope(shield=True):
@@ -1039,6 +1135,7 @@ class SubprocessCLITransport(Transport):
                 # not one that survived SIGKILL.
                 if self._process.returncode is not None:
                     _ACTIVE_CHILDREN.discard(self._process)
+                self._remove_config_dir()
 
             self._process = None
             self._stdout_stream = None
