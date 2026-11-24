@@ -62,16 +62,54 @@ def get_cli_version() -> str:
     )
 
 
+_WIN_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC"
+
+
+def _absolute_path_dirs() -> list[str]:
+    """PATH entries that name a fixed directory.
+
+    Empty, "." and other relative entries resolve against the process cwd. On
+    Windows Path.is_absolute() also requires a drive, dropping a rooted entry
+    that resolves against the current drive.
+    """
+    raw = os.environ.get("PATH")
+    if raw is None:
+        raw = os.defpath
+    return [entry for entry in raw.split(os.pathsep) if Path(entry).is_absolute()]
+
+
+def _which_claude() -> str | None:
+    """Absolute path of `claude` in an absolute PATH directory, or None.
+
+    On Windows, shutil.which searches the current directory before PATH even
+    when given an explicit `path`, so the Windows PATHEXT walk is done here.
+    """
+    dirs = _absolute_path_dirs()
+    if not dirs:
+        return None
+    if platform.system() != "Windows":
+        return shutil.which("claude", path=os.pathsep.join(dirs))
+
+    pathext_source = os.environ.get("PATHEXT") or _WIN_DEFAULT_PATHEXT
+    pathext = [ext for ext in pathext_source.split(os.pathsep) if ext]
+    for directory in dirs:
+        for ext in pathext:
+            full_path = Path(directory) / ("claude" + ext)
+            if full_path.is_file() and os.access(full_path, os.F_OK | os.X_OK):
+                return str(full_path)
+    return None
+
+
 def find_installed_cli() -> Path | None:
     """Find the installed Claude CLI binary."""
     system = platform.system()
 
     if system == "Windows":
         # Windows installation locations (matches test.yml: $USERPROFILE\.local\bin)
-        locations = [
-            Path.home() / ".local" / "bin" / "claude.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Claude" / "claude.exe",
-        ]
+        locations = [Path.home() / ".local" / "bin" / "claude.exe"]
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            locations.append(Path(local_app_data) / "Claude" / "claude.exe")
     else:
         # Unix installation locations
         locations = [
@@ -81,12 +119,12 @@ def find_installed_cli() -> Path | None:
         ]
 
     # Also check PATH
-    cli_path = shutil.which("claude")
+    cli_path = _which_claude()
     if cli_path:
         return Path(cli_path)
 
     for path in locations:
-        if path.exists() and path.is_file():
+        if path.is_absolute() and path.exists() and path.is_file():
             return path
 
     return None
