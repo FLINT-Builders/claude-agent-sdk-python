@@ -385,14 +385,10 @@ def _read_session_lite(file_path: Path) -> _LiteSessionFile | None:
 # ---------------------------------------------------------------------------
 
 
-def _get_worktree_paths(cwd: str) -> list[str]:
-    """Returns absolute worktree paths for the git repo containing cwd.
-
-    Returns empty list if git is unavailable or cwd is not in a repo.
-    """
+def _run_git(cwd: str, *args: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
+            ["git", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -400,16 +396,88 @@ def _get_worktree_paths(cwd: str) -> list[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return result.stdout
+
+
+def _real(path: str | Path) -> Path:
+    return Path(os.path.realpath(path))
+
+
+def _read_path_file(path: Path, prefix: str = "") -> Path | None:
+    """Reads a git pointer file and resolves it relative to its directory."""
+    try:
+        with path.open(encoding="utf-8") as f:
+            content = f.read(4096).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not content.startswith(prefix):
+        return None
+    target = content[len(prefix) :].strip()
+    if not target or "\n" in target:
+        return None
+    return _real(path.parent / target)
+
+
+def _belongs_to_repo(worktree: str, common_dir: Path) -> bool:
+    """Checks that ``worktree`` itself declares membership in ``common_dir``.
+
+    ``git worktree list`` derives linked worktree paths from
+    ``<common_dir>/worktrees/<id>/gitdir``, which is content of the repository
+    that lists them. Accept a path only when the worktree's own ``.git``
+    (controlled by whoever owns that directory) binds it to ``common_dir``:
+    either it is the main worktree whose ``.git`` directory *is*
+    ``common_dir``, or its ``.git`` gitfile names an admin dir under
+    ``common_dir/worktrees`` whose ``gitdir`` file points back at it.
+    """
+    dot_git = _real(worktree) / ".git"
+    if dot_git.is_symlink():
+        return False
+    if dot_git.is_dir():
+        return dot_git == common_dir
+    if not dot_git.is_file():
+        return False
+    admin_dir = _read_path_file(dot_git, "gitdir:")
+    if admin_dir is None or admin_dir.parent != common_dir / "worktrees":
+        return False
+    return _read_path_file(admin_dir / "gitdir") == dot_git
+
+
+def _get_worktree_paths(cwd: str) -> list[str]:
+    """Returns absolute worktree paths for the git repo containing cwd.
+
+    Only worktrees that verifiably belong to the same repository as ``cwd``
+    are returned (see :func:`_belongs_to_repo`). Returns an empty list if git
+    is unavailable, cwd is not in a repo, or cwd's own worktree cannot be
+    verified.
+    """
+    rev_parse = _run_git(cwd, "rev-parse", "--show-toplevel", "--git-common-dir")
+    if rev_parse is None:
+        return []
+    lines = rev_parse.splitlines()
+    if len(lines) != 2:
+        return []
+    toplevel, common = lines
+    common_dir = _real(Path(cwd) / common)
+    if not _belongs_to_repo(toplevel, common_dir):
         return []
 
-    if result.returncode != 0 or not result.stdout:
+    listing = _run_git(cwd, "worktree", "list", "--porcelain")
+    if listing is None:
         return []
 
     paths = []
-    for line in result.stdout.split("\n"):
-        if line.startswith("worktree "):
-            path = unicodedata.normalize("NFC", line[len("worktree ") :])
-            paths.append(path)
+    for block in listing.split("\n\n"):
+        entry = block.split("\n")
+        if not entry[0].startswith("worktree "):
+            continue
+        if any(line == "prunable" or line.startswith("prunable ") for line in entry):
+            continue
+        path = entry[0][len("worktree ") :]
+        if _belongs_to_repo(path, common_dir):
+            paths.append(unicodedata.normalize("NFC", path))
     return paths
 
 
