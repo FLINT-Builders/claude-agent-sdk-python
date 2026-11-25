@@ -27,6 +27,7 @@ from claude_agent_sdk._internal.session_resume import (
     materialize_resume_session,
 )
 from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk._internal.sessions import _canonicalize_path, _sanitize_path
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 from claude_agent_sdk.types import SessionKey, SessionStore, SessionStoreEntry
 
@@ -44,6 +45,12 @@ def cwd(tmp_path: Path) -> Path:
 @pytest.fixture
 def project_key(cwd: Path) -> str:
     return project_key_for_directory(cwd)
+
+
+@pytest.fixture
+def cli_project_dir(cwd: Path) -> str:
+    """Directory name the CLI resumes from for ``cwd``."""
+    return _sanitize_path(_canonicalize_path(str(cwd)))
 
 
 @pytest.fixture
@@ -121,7 +128,7 @@ class TestNoMaterialization:
 class TestHappyPath:
     @pytest.mark.anyio
     async def test_resume_writes_jsonl_and_cleanup_removes_dir(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         store = InMemorySessionStore()
         entries: list[SessionStoreEntry] = [
@@ -142,7 +149,7 @@ class TestHappyPath:
         assert m.resume_session_id == SESSION_ID
         assert m.config_dir.is_dir()
 
-        jsonl = m.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+        jsonl = m.config_dir / "projects" / cli_project_dir / f"{SESSION_ID}.jsonl"
         assert jsonl.is_file()
         lines = jsonl.read_text().splitlines()
         assert len(lines) == 2
@@ -411,7 +418,7 @@ class TestHappyPath:
 
     @pytest.mark.anyio
     async def test_unreadable_seed_files_do_not_abort_resume(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         config = isolated_home / ".claude"
         config.mkdir()
@@ -427,7 +434,7 @@ class TestHappyPath:
         assert not (m.config_dir / ".claude.json").exists()
         # The transcript itself was still materialized.
         assert (
-            m.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+            m.config_dir / "projects" / cli_project_dir / f"{SESSION_ID}.jsonl"
         ).exists()
         await m.cleanup()
 
@@ -567,7 +574,7 @@ class TestHappyPath:
 class TestSubkeyMaterialization:
     @pytest.mark.anyio
     async def test_subagent_jsonl_and_meta_json(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         store = InMemorySessionStore()
         main_key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
@@ -591,7 +598,7 @@ class TestSubkeyMaterialization:
         m = await materialize_resume_session(opts)
         assert m is not None
 
-        session_dir = m.config_dir / "projects" / project_key / SESSION_ID
+        session_dir = m.config_dir / "projects" / cli_project_dir / SESSION_ID
         jsonl = session_dir / "subagents" / "agent-abc.jsonl"
         meta = session_dir / "subagents" / "agent-abc.meta.json"
 
@@ -610,7 +617,7 @@ class TestSubkeyMaterialization:
 
     @pytest.mark.anyio
     async def test_traversal_guards(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         class EvilStore(InMemorySessionStore):
             async def list_subkeys(self, key):  # type: ignore[override]
@@ -641,12 +648,12 @@ class TestSubkeyMaterialization:
         m = await materialize_resume_session(opts)
         assert m is not None
 
-        session_dir = m.config_dir / "projects" / project_key / SESSION_ID
+        session_dir = m.config_dir / "projects" / cli_project_dir / SESSION_ID
         # Only the safe subpath was written.
         assert (session_dir / "subagents" / "agent-ok.jsonl").is_file()
         # Main transcript was not overwritten by any subkey load (regression
         # for subpath='.' which previously resolved to project_dir/{sid}.jsonl).
-        main_jsonl = m.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+        main_jsonl = m.config_dir / "projects" / cli_project_dir / f"{SESSION_ID}.jsonl"
         assert [json.loads(line) for line in main_jsonl.read_text().splitlines()] == [
             {"type": "user", "uuid": "main"}
         ]
@@ -659,7 +666,7 @@ class TestSubkeyMaterialization:
 
     @pytest.mark.anyio
     async def test_store_without_list_subkeys_skips_subagents(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         class MinimalStore(SessionStore):
             async def append(self, key, entries):  # type: ignore[override]
@@ -675,9 +682,9 @@ class TestSubkeyMaterialization:
         assert m is not None
         # Just the main transcript — no subagent dir created.
         assert (
-            m.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+            m.config_dir / "projects" / cli_project_dir / f"{SESSION_ID}.jsonl"
         ).is_file()
-        assert not (m.config_dir / "projects" / project_key / SESSION_ID).exists()
+        assert not (m.config_dir / "projects" / cli_project_dir / SESSION_ID).exists()
         await m.cleanup()
 
 
@@ -930,7 +937,7 @@ def _make_mock_transport() -> Any:
 class TestClientIntegration:
     @pytest.mark.anyio
     async def test_connect_passes_config_dir_resume_and_suppresses_continue(
-        self, cwd: Path, project_key: str, isolated_home: Path
+        self, cwd: Path, project_key: str, cli_project_dir: str, isolated_home: Path
     ) -> None:
         store = InMemorySessionStore()
         await store.append(
@@ -974,7 +981,7 @@ class TestClientIntegration:
         config_dir = transport_opts.env["CLAUDE_CONFIG_DIR"]
         assert Path(config_dir).is_dir()
         assert (
-            Path(config_dir) / "projects" / project_key / f"{SESSION_ID}.jsonl"
+            Path(config_dir) / "projects" / cli_project_dir / f"{SESSION_ID}.jsonl"
         ).is_file()
 
         # Build the actual CLI command (real class, outside the patch) to

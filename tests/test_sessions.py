@@ -24,6 +24,7 @@ from claude_agent_sdk._internal.sessions import (
     _extract_json_string_field,
     _extract_last_json_string_field,
     _parse_session_info_from_lite,
+    _project_key,
     _read_session_lite,
     _sanitize_path,
     _simple_hash,
@@ -116,9 +117,8 @@ def _make_session_file(
 
 
 def _make_project_dir(config_dir: Path, project_path: str) -> Path:
-    """Creates a sanitized project directory for the given path."""
-    sanitized = _sanitize_path(project_path)
-    project_dir = config_dir / "projects" / sanitized
+    """Creates the project directory for the given path."""
+    project_dir = config_dir / "projects" / _project_key(project_path)
     project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir
 

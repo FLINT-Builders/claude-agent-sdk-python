@@ -53,6 +53,10 @@ from claude_agent_sdk import (  # noqa: E402
 from claude_agent_sdk._internal.session_resume import (  # noqa: E402
     materialize_resume_session,
 )
+from claude_agent_sdk._internal.sessions import (  # noqa: E402
+    _canonicalize_path,
+    _sanitize_path,
+)
 from claude_agent_sdk._internal.transcript_mirror_batcher import (  # noqa: E402
     TranscriptMirrorBatcher,
 )
@@ -202,6 +206,7 @@ class TestRoundTrip:
         cwd = tmp_path / "project"
         cwd.mkdir()
         project_key = project_key_for_directory(cwd)
+        cli_dir = _sanitize_path(_canonicalize_path(str(cwd)))
 
         errors: list[tuple] = []
 
@@ -236,7 +241,7 @@ class TestRoundTrip:
         try:
             assert result.resume_session_id == SESSION_ID
             jsonl = (
-                result.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+                result.config_dir / "projects" / cli_dir / f"{SESSION_ID}.jsonl"
             ).read_text()
             # Deep-equal (not byte-equal): JSONB may have reordered keys, and
             # _entries_to_jsonl re-serializes with "type" hoisted first.
@@ -244,7 +249,7 @@ class TestRoundTrip:
             sub_jsonl = (
                 result.config_dir
                 / "projects"
-                / project_key
+                / cli_dir
                 / SESSION_ID
                 / "subagents"
                 / "agent-1.jsonl"

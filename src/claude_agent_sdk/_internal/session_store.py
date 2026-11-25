@@ -146,11 +146,18 @@ class InMemorySessionStore(SessionStore):
         self._last_mtime = 0
 
 
-def file_path_to_session_key(file_path: str, projects_dir: str) -> SessionKey | None:
+def file_path_to_session_key(
+    file_path: str, projects_dir: str, project_key: str | None = None
+) -> SessionKey | None:
     """Derive a :class:`SessionKey` from an absolute transcript file path.
 
-    Main transcripts: ``<projects_dir>/<project_key>/<session_id>.jsonl``
-    Subagent transcripts: ``<projects_dir>/<project_key>/<session_id>/subagents/agent-<id>.jsonl``
+    Main transcripts: ``<projects_dir>/<project_dir>/<session_id>.jsonl``
+    Subagent transcripts: ``<projects_dir>/<project_dir>/<session_id>/subagents/agent-<id>.jsonl``
+
+    The key's ``project_key`` is ``project_key`` when given, else the
+    ``<project_dir>`` name. Pass ``project_key`` for files the CLI wrote:
+    its directory names are shared by distinct paths, so they are not a
+    project identity.
 
     Returns ``None`` if ``file_path`` is not under ``projects_dir`` or has an
     unrecognized shape.
@@ -170,7 +177,8 @@ def file_path_to_session_key(file_path: str, projects_dir: str) -> SessionKey | 
     if len(parts) < 2:
         return None
 
-    project_key = parts[0]
+    if project_key is None:
+        project_key = parts[0]
     second = parts[1]
 
     # Main transcript: <project_key>/<session_id>.jsonl

@@ -38,9 +38,11 @@ from .sessions import (
     _canonicalize_path,
     _extract_first_prompt_from_head,
     _extract_last_json_string_field,
-    _find_project_dir,
     _get_projects_dir,
-    _get_worktree_paths,
+    _resolve_session_file,
+    _same_file,
+    _scoped_project_dirs,
+    _session_cwd_matches,
     _validate_uuid,
     project_key_for_directory,
 )
@@ -213,13 +215,16 @@ def delete_session(
     if not _validate_uuid(session_id):
         raise ValueError(f"Invalid session_id: {session_id}")
 
-    path = _find_session_file(session_id, directory)
-    if path is None:
+    resolved = _resolve_session_file(session_id, directory)
+    if resolved is None:
         raise FileNotFoundError(
             f"Session {session_id} not found"
             + (f" in project directory for {directory}" if directory else "")
         )
+    path = resolved.path
     try:
+        if not _same_file(path.stat(), resolved.stat):
+            raise FileNotFoundError(f"Session {session_id} not found")
         path.unlink()
     except OSError as e:
         if e.errno == errno.ENOENT:
@@ -295,15 +300,18 @@ def fork_session(
     if up_to_message_id and not _validate_uuid(up_to_message_id):
         raise ValueError(f"Invalid up_to_message_id: {up_to_message_id}")
 
-    source = _find_session_file_with_dir(session_id, directory)
+    source = _resolve_session_file(session_id, directory)
     if source is None:
         raise FileNotFoundError(
             f"Session {session_id} not found"
             + (f" in project directory for {directory}" if directory else "")
         )
-    file_path, project_dir = source
+    project_dir = source.path.parent
 
-    content = file_path.read_bytes()
+    with source.path.open("rb") as f:
+        if not _same_file(os.fstat(f.fileno()), source.stat):
+            raise FileNotFoundError(f"Session {session_id} not found")
+        content = f.read()
     if not content:
         raise ValueError(f"Session {session_id} has no messages to fork")
 
@@ -489,73 +497,6 @@ def _build_fork_lines(
 # ---------------------------------------------------------------------------
 
 
-def _find_session_file(
-    session_id: str,
-    directory: str | None,
-) -> Path | None:
-    """Find the path to a session's JSONL file.
-
-    Returns the path if found, None otherwise.
-    """
-    result = _find_session_file_with_dir(session_id, directory)
-    return result[0] if result else None
-
-
-def _find_session_file_with_dir(
-    session_id: str,
-    directory: str | None,
-) -> tuple[Path, Path] | None:
-    """Find a session file and its containing project directory.
-
-    Returns ``(file_path, project_dir)`` or None. The fork operation
-    needs the project dir to write the new file adjacent to the source.
-    """
-    file_name = f"{session_id}.jsonl"
-
-    def _try_dir(project_dir: Path) -> tuple[Path, Path] | None:
-        path = project_dir / file_name
-        try:
-            st = path.stat()
-            if st.st_size > 0:
-                return (path, project_dir)
-        except OSError:
-            pass
-        return None
-
-    if directory:
-        canonical = _canonicalize_path(directory)
-        project_dir = _find_project_dir(canonical)
-        if project_dir is not None:
-            result = _try_dir(project_dir)
-            if result:
-                return result
-
-        try:
-            worktree_paths = _get_worktree_paths(canonical)
-        except Exception:
-            worktree_paths = []
-        for wt in worktree_paths:
-            if wt == canonical:
-                continue
-            wt_project_dir = _find_project_dir(wt)
-            if wt_project_dir is not None:
-                result = _try_dir(wt_project_dir)
-                if result:
-                    return result
-        return None
-
-    projects_dir = _get_projects_dir()
-    try:
-        dirents = list(projects_dir.iterdir())
-    except OSError:
-        return None
-    for entry in dirents:
-        result = _try_dir(entry)
-        if result:
-            return result
-    return None
-
-
 _TRANSCRIPT_TYPES = frozenset({"user", "assistant", "attachment", "system", "progress"})
 
 
@@ -635,25 +576,13 @@ def _append_to_session(
     file_name = f"{session_id}.jsonl"
 
     if directory:
-        canonical = _canonicalize_path(directory)
-
-        # Try the exact/prefix-matched project directory first.
-        project_dir = _find_project_dir(canonical)
-        if project_dir is not None and _try_append(project_dir / file_name, data):
-            return
-
         # Worktree fallback — matches list_sessions/get_session_messages.
         # Sessions may live under a different worktree root.
-        try:
-            worktree_paths = _get_worktree_paths(canonical)
-        except Exception:
-            worktree_paths = []
-        for wt in worktree_paths:
-            if wt == canonical:
-                continue  # already tried above
-            wt_project_dir = _find_project_dir(wt)
-            if wt_project_dir is not None and _try_append(
-                wt_project_dir / file_name, data
+        for candidate in _scoped_project_dirs(_canonicalize_path(directory)):
+            if _try_append(
+                candidate.path / file_name,
+                data,
+                candidate.project_path if candidate.verify_cwd else None,
             ):
                 return
 
@@ -675,11 +604,16 @@ def _append_to_session(
     raise FileNotFoundError(f"Session {session_id} not found in any project directory")
 
 
-def _try_append(path: Path, data: str) -> bool:
+def _try_append(path: Path, data: str, verify_project_path: str | None = None) -> bool:
     """Try appending to a path.
 
     Opens with O_WRONLY | O_APPEND (no O_CREAT), so the open fails with
     ENOENT if the file does not exist — no separate existence check.
+
+    With ``verify_project_path`` (a file in a CLI-named project directory),
+    the file is opened for reading too and its head, read through the same
+    descriptor that is written, must record that path as its ``cwd``;
+    otherwise nothing is written and ``False`` is returned.
 
     Returns ``True`` on successful write, ``False`` if the file does not
     exist (ENOENT/ENOTDIR) or is 0-byte. A 0-byte ``.jsonl`` is a "session
@@ -695,8 +629,9 @@ def _try_append(path: Path, data: str) -> bool:
     CPython handles this correctly on all platforms, so no explicit-position
     fallback is needed.
     """
+    access = os.O_WRONLY if verify_project_path is None else os.O_RDWR
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+        fd = os.open(path, access | os.O_APPEND)
     except OSError as e:
         if e.errno in (errno.ENOENT, errno.ENOTDIR):
             return False
@@ -705,6 +640,11 @@ def _try_append(path: Path, data: str) -> bool:
         stat = os.fstat(fd)
         if stat.st_size == 0:
             return False
+        if verify_project_path is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            head = os.read(fd, LITE_READ_BUF_SIZE).decode("utf-8", errors="replace")
+            if not _session_cwd_matches(head, [verify_project_path]):
+                return False
         os.write(fd, data.encode("utf-8"))
         return True
     finally:

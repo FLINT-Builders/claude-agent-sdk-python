@@ -67,6 +67,9 @@ class TranscriptMirrorBatcher:
     send_timeout: float = SEND_TIMEOUT_SECONDS
     max_pending_entries: int = MAX_PENDING_ENTRIES
     max_pending_bytes: int = MAX_PENDING_BYTES
+    # Key every frame under this project instead of the directory name in
+    # its file path (see ``file_path_to_session_key``).
+    project_key: str | None = None
 
     _pending: list[_MirrorEntry] = field(default_factory=list)
     _pending_entries: int = 0
@@ -165,7 +168,9 @@ class TranscriptMirrorBatcher:
                 # Avoid creating phantom keys in adapters that touch storage
                 # on append([]) — nothing to write.
                 continue
-            key = file_path_to_session_key(file_path, self.projects_dir)
+            key = file_path_to_session_key(
+                file_path, self.projects_dir, self.project_key
+            )
             if key is None:
                 logger.warning(
                     "[SessionStore] dropping mirror frame: filePath %s is not "

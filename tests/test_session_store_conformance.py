@@ -232,11 +232,11 @@ class TestProjectKeyForDirectory:
         from the literal '.' (which would silently miss store lookups)."""
         from pathlib import Path
 
-        from claude_agent_sdk._internal.sessions import _sanitize_path
+        from claude_agent_sdk._internal.sessions import _project_key
 
         key = project_key_for_directory(".")
-        assert key == _sanitize_path(str(Path().resolve()))
-        assert key != _sanitize_path(".")
+        assert key == _project_key(str(Path().resolve()))
+        assert key != _project_key(".")
 
     def test_nfc_normalizes_decomposed_unicode(self, tmp_path) -> None:
         """Parity with TS: the CLI canonicalizes via realpath + NFC. On macOS
@@ -252,19 +252,15 @@ class TestProjectKeyForDirectory:
             str(nfd)
         )
 
-    def test_long_path_uses_portable_djb2_suffix(self) -> None:
-        """Parity with TS: paths > MAX_SANITIZED_LENGTH get a djb2 hash
-        suffix (runtime-portable so parent and subprocess derive the
-        same project_key)."""
+    def test_long_path_keyed_by_full_path(self) -> None:
+        """Paths > MAX_SANITIZED_LENGTH that share the truncated readable
+        prefix still get distinct keys, short enough for one path component."""
         from pathlib import Path
 
-        from claude_agent_sdk._internal.sessions import (
-            MAX_SANITIZED_LENGTH,
-            _simple_hash,
-        )
+        from claude_agent_sdk._internal.sessions import MAX_SANITIZED_LENGTH
 
-        long_dir = str(Path("/" + "a" * (MAX_SANITIZED_LENGTH + 50)).resolve())
-        key = project_key_for_directory(long_dir)
-        portable_suffix = _simple_hash(long_dir)
-        assert key.endswith("-" + portable_suffix)
-        assert len(key) > MAX_SANITIZED_LENGTH
+        shared = "/" + "a" * (MAX_SANITIZED_LENGTH + 50)
+        key_a = project_key_for_directory(str(Path(shared + "/x").resolve()))
+        key_b = project_key_for_directory(str(Path(shared + "/y").resolve()))
+        assert key_a != key_b
+        assert len(key_a) <= 255

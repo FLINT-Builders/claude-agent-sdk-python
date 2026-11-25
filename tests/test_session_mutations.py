@@ -20,7 +20,7 @@ from claude_agent_sdk._internal.session_mutations import (
     _sanitize_unicode,
     _try_append,
 )
-from claude_agent_sdk._internal.sessions import _sanitize_path, get_session_messages
+from claude_agent_sdk._internal.sessions import _project_key, get_session_messages
 
 # ---------------------------------------------------------------------------
 # Fixtures (shared with test_sessions.py patterns)
@@ -38,9 +38,8 @@ def claude_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _make_project_dir(config_dir: Path, project_path: str) -> Path:
-    """Creates a sanitized project directory for the given path."""
-    sanitized = _sanitize_path(project_path)
-    project_dir = config_dir / "projects" / sanitized
+    """Creates the project directory for the given path."""
+    project_dir = config_dir / "projects" / _project_key(project_path)
     project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir
 
