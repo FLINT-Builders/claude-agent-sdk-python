@@ -21,6 +21,7 @@ from .session_resume import (
     materialize_resume_session,
 )
 from .session_store_validation import validate_session_store_options
+from .tool_rules import validate_agent_tool_rules
 from .transport import Transport
 from .transport.subprocess_cli import SubprocessCLITransport
 
@@ -85,6 +86,15 @@ class InternalClient:
                 configured_options, materialized
             )
 
+        # Convert agents to dict format for initialize request
+        agents_dict = None
+        if configured_options.agents:
+            agents_dict = {
+                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
+                for name, agent_def in configured_options.agents.items()
+            }
+            validate_agent_tool_rules(agents_dict)
+
         # Use provided transport or create subprocess transport
         if transport is not None:
             chosen_transport = transport
@@ -119,14 +129,6 @@ class InternalClient:
             snapshot = sp.get("snapshot")
             if isinstance(snapshot, bool):
                 system_prompt_snapshot = snapshot
-
-        # Convert agents to dict format for initialize request
-        agents_dict = None
-        if configured_options.agents:
-            agents_dict = {
-                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
-                for name, agent_def in configured_options.agents.items()
-            }
 
         # Match ClaudeSDKClient.connect() — without this, query() ignores the env var
         initialize_timeout_ms = int(

@@ -29,6 +29,7 @@ from ...types import (
     SystemPromptPreset,
 )
 from .._task_compat import TaskHandle, spawn_detached
+from ..tool_rules import validate_tool_rules
 from . import Transport
 
 logger = logging.getLogger(__name__)
@@ -588,10 +589,12 @@ class SubprocessCLITransport(Transport):
         if self._options.tools is not None:
             tools = self._options.tools
             if isinstance(tools, list):
-                if len(tools) == 0:
+                tool_names = list(tools)
+                validate_tool_rules("tools", tool_names)
+                if len(tool_names) == 0:
                     cmd.extend(["--tools", ""])
                 else:
-                    cmd.extend(["--tools", ",".join(tools)])
+                    cmd.extend(["--tools", ",".join(tool_names)])
             else:
                 # Preset object - 'claude_code' preset maps to 'default'
                 cmd.extend(["--tools", "default"])
@@ -600,6 +603,7 @@ class SubprocessCLITransport(Transport):
             self._apply_skills_defaults()
         )
 
+        validate_tool_rules("allowed_tools", effective_allowed_tools)
         if effective_allowed_tools:
             cmd.extend(["--allowedTools", ",".join(effective_allowed_tools)])
 
@@ -609,8 +613,10 @@ class SubprocessCLITransport(Transport):
         if self._options.max_budget_usd is not None:
             cmd.extend(["--max-budget-usd", str(self._options.max_budget_usd)])
 
-        if self._options.disallowed_tools:
-            cmd.extend(["--disallowedTools", ",".join(self._options.disallowed_tools)])
+        disallowed_tools = list(self._options.disallowed_tools)
+        validate_tool_rules("disallowed_tools", disallowed_tools)
+        if disallowed_tools:
+            cmd.extend(["--disallowedTools", ",".join(disallowed_tools)])
 
         if self._options.task_budget is not None:
             cmd.extend(["--task-budget", str(self._options.task_budget["total"])])

@@ -139,6 +139,7 @@ class ClaudeSDKClient:
             apply_materialized_options,
             build_mirror_batcher,
         )
+        from ._internal.tool_rules import validate_agent_tool_rules
         from ._internal.transport.subprocess_cli import SubprocessCLITransport
 
         # Validate and configure permission settings (matching TypeScript SDK logic)
@@ -146,6 +147,15 @@ class ClaudeSDKClient:
 
         if self._materialized is not None:
             options = apply_materialized_options(options, self._materialized)
+
+        # Convert agents to dict format for initialize request
+        agents_dict: dict[str, dict[str, Any]] | None = None
+        if self.options.agents:
+            agents_dict = {
+                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
+                for name, agent_def in self.options.agents.items()
+            }
+            validate_agent_tool_rules(agents_dict)
 
         # Use provided custom transport or create subprocess transport
         if self._custom_transport:
@@ -184,14 +194,6 @@ class ClaudeSDKClient:
             snapshot = sp.get("snapshot")
             if isinstance(snapshot, bool):
                 system_prompt_snapshot = snapshot
-
-        # Convert agents to dict format for initialize request
-        agents_dict: dict[str, dict[str, Any]] | None = None
-        if self.options.agents:
-            agents_dict = {
-                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
-                for name, agent_def in self.options.agents.items()
-            }
 
         self._verbatim_prompts = self.options.verbatim_prompts
 
