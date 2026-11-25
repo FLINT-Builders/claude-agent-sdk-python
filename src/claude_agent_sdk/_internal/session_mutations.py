@@ -637,7 +637,7 @@ def _append_to_session(
     if directory:
         canonical = _canonicalize_path(directory)
 
-        # Try the exact/prefix-matched project directory first.
+        # Try the project directory first.
         project_dir = _find_project_dir(canonical)
         if project_dir is not None and _try_append(project_dir / file_name, data):
             return
