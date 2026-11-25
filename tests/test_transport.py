@@ -1695,54 +1695,97 @@ class TestSubprocessCLITransport:
 
         anyio.run(_test)
 
-    def test_connect_as_different_user(self):
-        """Test connect as different user."""
+    @staticmethod
+    def _mock_spawns() -> list[MagicMock]:
+        """Version-probe process followed by the main CLI process."""
+        mock_version_process = MagicMock()
+        mock_version_process.stdout = MagicMock()
+        mock_version_process.stdout.receive = AsyncMock(
+            return_value=b"2.0.0 (Claude Code)"
+        )
+        mock_version_process.terminate = MagicMock()
+        mock_version_process.wait = AsyncMock()
+
+        mock_process = MagicMock()
+        mock_process.stdout = MagicMock()
+        mock_stdin = MagicMock()
+        mock_stdin.aclose = AsyncMock()
+        mock_process.stdin = mock_stdin
+        mock_process.returncode = None
+        return [mock_version_process, mock_process]
+
+    def test_session_user_is_not_process_user(self):
+        """options.user is a session label and never switches the CLI account."""
 
         async def _test():
-            custom_user = "claude"
-            options = make_options(user=custom_user)
+            options = make_options(user="claude")
 
-            # Mock the subprocess to capture the env argument
             with patch(
                 "anyio.open_process", new_callable=AsyncMock
             ) as mock_open_process:
-                # Mock version check process
-                mock_version_process = MagicMock()
-                mock_version_process.stdout = MagicMock()
-                mock_version_process.stdout.receive = AsyncMock(
-                    return_value=b"2.0.0 (Claude Code)"
-                )
-                mock_version_process.terminate = MagicMock()
-                mock_version_process.wait = AsyncMock()
+                mock_open_process.side_effect = self._mock_spawns()
 
-                # Mock main process
-                mock_process = MagicMock()
-                mock_process.stdout = MagicMock()
-                mock_stdin = MagicMock()
-                mock_stdin.aclose = AsyncMock()  # Add async aclose method
-                mock_process.stdin = mock_stdin
-                mock_process.returncode = None
-
-                # Return version process first, then main process
-                mock_open_process.side_effect = [mock_version_process, mock_process]
-
-                transport = SubprocessCLITransport(
-                    prompt="test",
-                    options=options,
-                )
-
+                transport = SubprocessCLITransport(prompt="test", options=options)
                 await transport.connect()
 
-                # Verify open_process was called twice (version check + main process)
                 assert mock_open_process.call_count == 2
+                for call in mock_open_process.call_args_list:
+                    for key in ("user", "group", "extra_groups"):
+                        assert call.kwargs.get(key) is None
 
-                # Check the second call (main process) for user
-                second_call_kwargs = mock_open_process.call_args_list[1].kwargs
-                assert "user" in second_call_kwargs
-                user_passed = second_call_kwargs["user"]
+        anyio.run(_test)
 
-                # Check that user was passed
-                assert user_passed == "claude"
+    def test_connect_as_subprocess_user(self):
+        """subprocess_user is resolved once to numeric uid, gid, and groups."""
+
+        async def _test():
+            import pwd
+
+            options = make_options(subprocess_user="claude")
+            entry = MagicMock(pw_name="claude", pw_uid=4242, pw_gid=4343)
+
+            with (
+                patch(
+                    "anyio.open_process", new_callable=AsyncMock
+                ) as mock_open_process,
+                patch.object(pwd, "getpwnam", return_value=entry) as getpwnam,
+                patch.object(os, "getgrouplist", return_value=[4343, 27]),
+            ):
+                mock_open_process.side_effect = self._mock_spawns()
+
+                transport = SubprocessCLITransport(prompt="test", options=options)
+                await transport.connect()
+
+                getpwnam.assert_called_once_with("claude")
+                assert mock_open_process.call_count == 2
+                version_kwargs = mock_open_process.call_args_list[0].kwargs
+                assert version_kwargs.get("user") is None
+                main_kwargs = mock_open_process.call_args_list[1].kwargs
+                assert main_kwargs["user"] == 4242
+                assert main_kwargs["group"] == 4343
+                assert main_kwargs["extra_groups"] == [4343, 27]
+
+        anyio.run(_test)
+
+    def test_unknown_subprocess_user_fails_closed(self):
+        """An unknown subprocess_user raises instead of running as the caller."""
+
+        async def _test():
+            from claude_agent_sdk._errors import CLIConnectionError
+
+            options = make_options(subprocess_user=f"missing-{uuid.uuid4().hex}")
+
+            with patch(
+                "anyio.open_process", new_callable=AsyncMock
+            ) as mock_open_process:
+                mock_open_process.side_effect = self._mock_spawns()
+
+                transport = SubprocessCLITransport(prompt="test", options=options)
+                with pytest.raises(CLIConnectionError, match="not a local account"):
+                    await transport.connect()
+
+                # Only the version probe ran; the CLI itself was never spawned.
+                assert mock_open_process.call_count == 1
 
         anyio.run(_test)
 

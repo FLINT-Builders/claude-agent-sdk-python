@@ -2164,7 +2164,25 @@ class ClaudeAgentOptions:
     """
 
     user: str | None = None
-    """Optional user identifier associated with the session."""
+    """Optional user identifier associated with the session.
+
+    This is an application-level label only. It never changes the operating
+    system account the Claude Code CLI runs as; see ``subprocess_user``.
+    """
+
+    subprocess_user: str | int | None = None
+    """Unix account (login name or numeric uid) to run the Claude Code CLI as.
+
+    When set, the account is resolved once and the CLI is started with its
+    uid, primary gid, and supplementary groups. ``HOME`` and other environment
+    variables are not changed. The calling process must be permitted to switch
+    to that account (typically it runs as root); otherwise ``connect()`` raises
+    instead of starting the CLI as the caller. Unknown accounts also raise.
+    Not supported on Windows.
+
+    This is an OS privilege setting. Never derive it from an application,
+    tenant, or end-user identifier.
+    """
 
     include_partial_messages: bool = False
     """Include partial/streaming message events in the output.

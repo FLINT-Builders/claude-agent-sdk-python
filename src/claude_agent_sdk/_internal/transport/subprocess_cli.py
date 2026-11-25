@@ -64,6 +64,41 @@ def _kill_active_children() -> None:
 atexit.register(_kill_active_children)
 
 
+def _resolve_subprocess_account(account: str | int) -> dict[str, Any]:
+    """Resolve ``subprocess_user`` once into numeric spawn credentials.
+
+    The account is looked up a single time and the CLI is started with the
+    resulting uid, primary gid, and supplementary groups, so the spawn never
+    re-resolves a name. Lookup or permission failures raise rather than
+    falling back to the caller's account.
+    """
+    if platform.system() == "Windows":
+        raise CLIConnectionError("subprocess_user is only supported on POSIX systems")
+    if isinstance(account, bool) or not isinstance(account, (str, int)):
+        raise CLIConnectionError(
+            "subprocess_user must be a Unix login name or numeric uid"
+        )
+
+    import pwd
+
+    try:
+        entry = (
+            pwd.getpwuid(account) if isinstance(account, int) else pwd.getpwnam(account)
+        )
+    except (KeyError, OverflowError, ValueError) as e:
+        raise CLIConnectionError(
+            f"subprocess_user {account!r} is not a local account"
+        ) from e
+
+    if entry.pw_uid == os.getuid() == os.geteuid():
+        return {}
+    return {
+        "user": entry.pw_uid,
+        "group": entry.pw_gid,
+        "extra_groups": os.getgrouplist(entry.pw_name, entry.pw_gid),
+    }
+
+
 # Parentheses and commas are delimiters to the --allowedTools tokenizer;
 # control characters (C0, DEL, C1) never appear in a skill directory name.
 # U+FEFF is here rather than with the whitespace check below because the
@@ -856,6 +891,14 @@ class SubprocessCLITransport(Transport):
             # Pipe stderr only when the caller registered a callback.
             stderr_dest = PIPE if self._options.stderr is not None else None
 
+            # ``options.user`` is a session label and must never reach the
+            # spawn; only the explicit ``subprocess_user`` may switch accounts.
+            account_kwargs: dict[str, Any] = {}
+            if self._options.subprocess_user is not None:
+                account_kwargs = _resolve_subprocess_account(
+                    self._options.subprocess_user
+                )
+
             self._process = await anyio.open_process(
                 cmd,
                 stdin=PIPE,
@@ -863,7 +906,7 @@ class SubprocessCLITransport(Transport):
                 stderr=stderr_dest,
                 cwd=self._cwd,
                 env=process_env,
-                user=self._options.user,
+                **account_kwargs,
             )
             _ACTIVE_CHILDREN.add(self._process)
 
