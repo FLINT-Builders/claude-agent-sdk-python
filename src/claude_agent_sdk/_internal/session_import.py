@@ -11,14 +11,16 @@ Mirrors the TypeScript SDK's ``importSessionToStore``.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 from ..types import SessionKey, SessionStore, SessionStoreEntry
 from .sessions import (
     _read_agent_metadata_sidecar,
-    _resolve_session_file_path,
+    _resolve_session_file,
+    _same_file,
     _validate_uuid,
 )
 from .transcript_mirror_batcher import MAX_PENDING_BYTES, MAX_PENDING_ENTRIES
@@ -43,11 +45,12 @@ async def import_session_to_store(
     live-mirror gap. Adapters should treat ``entry["uuid"]`` as an idempotency
     key so re-import is duplicate-safe.
 
-    The destination ``project_key`` is the name of the on-disk project
-    directory the session file was found in — the same key
-    :func:`file_path_to_session_key` (and thus ``TranscriptMirrorBatcher``)
-    would have produced for the same file — so an imported session is
-    indistinguishable from a live-mirrored one and resumable via
+    The destination ``project_key`` is the key of the project the session
+    file was found for (``directory`` or the git worktree it was found
+    under; with ``directory=None``, the directory the session was recorded
+    in) — the same key ``TranscriptMirrorBatcher`` produces for a session
+    run there — so an imported session is indistinguishable from a
+    live-mirrored one and resumable via
     ``query(options=ClaudeAgentOptions(session_store=store, resume=session_id))``
     from the original ``cwd``.
 
@@ -69,26 +72,25 @@ async def import_session_to_store(
     if not _validate_uuid(session_id):
         raise ValueError(f"Invalid session_id: {session_id}")
 
-    resolved = _resolve_session_file_path(session_id, directory)
+    resolved = _resolve_session_file(session_id, directory)
     if resolved is None:
         raise FileNotFoundError(f"Session {session_id} not found")
 
-    # Key under the on-disk project directory name — matches
-    # file_path_to_session_key() / TranscriptMirrorBatcher even when the
-    # resolver's search (directory=None) or worktree fallback found the file
-    # somewhere other than `directory`.
-    project_key = resolved.parent.name
+    project_key = resolved.project_key
     if batch_size <= 0:
         batch_size = MAX_PENDING_ENTRIES
 
     main_key: SessionKey = {"project_key": project_key, "session_id": session_id}
-    await _append_jsonl_file_in_batches(resolved, main_key, store, batch_size)
+    with resolved.path.open(encoding="utf-8") as f:
+        if not _same_file(os.fstat(f.fileno()), resolved.stat):
+            raise FileNotFoundError(f"Session {session_id} not found")
+        await _append_jsonl_lines_in_batches(f, main_key, store, batch_size)
 
     if not include_subagents:
         return
 
     # Subagent transcripts live at <projectDir>/<sessionId>/subagents/**.
-    session_dir = resolved.with_suffix("")
+    session_dir = resolved.path.with_suffix("")
     subagents_dir = session_dir / "subagents"
     for file_path in _collect_jsonl_files(subagents_dir):
         # subpath is the path relative to session_dir, '/'-joined, sans .jsonl —
@@ -128,19 +130,28 @@ async def _append_jsonl_file_in_batches(
     ``store.append()`` in batches of ``batch_size`` entries (or
     ``MAX_PENDING_BYTES`` of line text, whichever comes first). Skips blank
     lines."""
+    with file_path.open(encoding="utf-8") as f:
+        await _append_jsonl_lines_in_batches(f, key, store, batch_size)
+
+
+async def _append_jsonl_lines_in_batches(
+    f: TextIO,
+    key: SessionKey,
+    store: SessionStore,
+    batch_size: int,
+) -> None:
     batch: list[SessionStoreEntry] = []
     nbytes = 0
-    with file_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            batch.append(json.loads(line))
-            nbytes += len(line)
-            if len(batch) >= batch_size or nbytes >= MAX_PENDING_BYTES:
-                await store.append(key, batch)
-                batch = []
-                nbytes = 0
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        batch.append(json.loads(line))
+        nbytes += len(line)
+        if len(batch) >= batch_size or nbytes >= MAX_PENDING_BYTES:
+            await store.append(key, batch)
+            batch = []
+            nbytes = 0
     if batch:
         await store.append(key, batch)
 

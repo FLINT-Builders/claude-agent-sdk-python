@@ -37,7 +37,10 @@ from ..types import ClaudeAgentOptions, SessionKey, SessionStore, SessionStoreFl
 from .session_store_validation import _store_implements
 from .sessions import (
     _agent_metadata_sidecar_path,
+    _canonicalize_path,
     _get_projects_dir,
+    _project_key,
+    _sanitize_path,
     _split_agent_metadata,
     _validate_uuid,
     project_key_for_directory,
@@ -100,6 +103,7 @@ def build_mirror_batcher(
     env: dict[str, str] | None,
     on_error: Callable[[SessionKey | None, str], Awaitable[None]],
     flush_mode: SessionStoreFlushMode = "batched",
+    cwd: str | Path | None = None,
 ) -> TranscriptMirrorBatcher:
     """Construct the :class:`TranscriptMirrorBatcher` for a session.
 
@@ -107,6 +111,11 @@ def build_mirror_batcher(
     (so file_path → key resolution matches what the subprocess writes),
     otherwise to the standard projects directory under the effective
     ``CLAUDE_CONFIG_DIR``.
+
+    Mirrored entries are keyed under ``project_key_for_directory(cwd)``
+    (the session's working directory), not the name of the directory the
+    subprocess writes to: the CLI's directory names are shared by distinct
+    paths.
 
     ``flush_mode="eager"`` zeroes the batcher's pending thresholds so every
     enqueued frame schedules a background flush; ``"batched"`` keeps the
@@ -121,6 +130,7 @@ def build_mirror_batcher(
     return TranscriptMirrorBatcher(
         store=store,
         projects_dir=projects_dir,
+        project_key=project_key_for_directory(cwd),
         on_error=on_error,
         max_pending_entries=0 if eager else MAX_PENDING_ENTRIES,
         max_pending_bytes=0 if eager else MAX_PENDING_BYTES,
@@ -147,7 +157,10 @@ async def materialize_resume_session(
         return None
 
     timeout_s = options.load_timeout_ms / 1000
-    project_key = project_key_for_directory(options.cwd)
+    canonical_cwd = _canonicalize_path(
+        str(options.cwd) if options.cwd is not None else "."
+    )
+    project_key = _project_key(canonical_cwd)
 
     # Resolve the session ID — explicit resume wins; otherwise pick the
     # most-recently-modified non-sidechain session from the store. Empty
@@ -166,7 +179,9 @@ async def materialize_resume_session(
 
     tmp_base = Path(tempfile.mkdtemp(prefix="claude-resume-"))
     try:
-        project_dir = tmp_base / "projects" / project_key
+        # The CLI looks the session up under its own directory name for cwd.
+        # tmp_base holds only this session, so the lossy name is unambiguous.
+        project_dir = tmp_base / "projects" / _sanitize_path(canonical_cwd)
         project_dir.mkdir(parents=True, exist_ok=True)
         _write_jsonl(project_dir / f"{session_id}.jsonl", entries)
 

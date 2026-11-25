@@ -1,11 +1,18 @@
 """Session listing implementation.
 
-Scans ~/.claude/projects/<sanitized-cwd>/ for .jsonl session files and
-extracts metadata from stat + head/tail reads without full JSONL parsing.
+Scans ~/.claude/projects/<project>/ for .jsonl session files and extracts
+metadata from stat + head/tail reads without full JSONL parsing.
+
+A project is identified by :func:`_project_key` (a SHA-256 of the canonical
+path). The CLI names its own project directories with the lossy
+:func:`_sanitize_path`, under which distinct paths can share a directory, so
+a transcript found there is only attributed to a project when the ``cwd`` it
+records is that project's path.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -14,9 +21,10 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import anyio
 
@@ -60,6 +68,14 @@ _COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>")
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9]")
 
+# Hex digits of the SHA-256 kept in a project key. 32 keeps the key within
+# the 255-byte path component limit alongside the readable prefix.
+_PROJECT_KEY_HASH_LEN = 32
+
+# The CLI's directory names only contain [A-Za-z0-9-], so the "_" separator
+# keeps project keys disjoint from any directory name the CLI creates.
+_PROJECT_KEY_RE = re.compile(rf"^[a-zA-Z0-9-]*_[0-9a-f]{{{_PROJECT_KEY_HASH_LEN}}}$")
+
 
 # ---------------------------------------------------------------------------
 # UUID validation
@@ -102,16 +118,33 @@ def _simple_hash(s: str) -> str:
 
 
 def _sanitize_path(name: str) -> str:
-    """Makes a string safe for use as a directory name.
+    """Makes a string safe for use as a directory name, as the CLI does.
 
     Replaces all non-alphanumeric characters with hyphens. For paths
     exceeding MAX_SANITIZED_LENGTH, truncates and appends a hash suffix.
+
+    Lossy: distinct paths (``/a/b`` and ``/a-b``) share a result. Only used
+    to locate directories the CLI created, never as a project identity.
     """
     sanitized = _SANITIZE_RE.sub("-", name)
     if len(sanitized) <= MAX_SANITIZED_LENGTH:
         return sanitized
     h = _simple_hash(name)
     return f"{sanitized[:MAX_SANITIZED_LENGTH]}-{h}"
+
+
+def _project_key(canonical_path: str) -> str:
+    """Project identity for a canonical path.
+
+    A SHA-256 of the full path, behind a readable prefix that is for display
+    only. Used as the SDK's project directory name and the
+    :class:`SessionStore` ``project_key``.
+    """
+    digest = hashlib.sha256(
+        canonical_path.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    readable = _SANITIZE_RE.sub("-", canonical_path)[:MAX_SANITIZED_LENGTH]
+    return f"{readable}_{digest[:_PROJECT_KEY_HASH_LEN]}"
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +175,7 @@ def _get_projects_dir(env_override: dict[str, str] | None = None) -> Path:
 
 
 def _get_project_dir(project_path: str) -> Path:
-    return _get_projects_dir() / _sanitize_path(project_path)
+    return _get_projects_dir() / _project_key(project_path)
 
 
 def _canonicalize_path(d: str) -> str:
@@ -154,33 +187,203 @@ def _canonicalize_path(d: str) -> str:
         return unicodedata.normalize("NFC", d)
 
 
-def _find_project_dir(project_path: str) -> Path | None:
-    """Finds the project directory for a given path.
+class _ProjectDir(NamedTuple):
+    """A directory that may hold sessions for ``project_path``.
 
-    Tolerates hash mismatches for long paths (>200 chars). The CLI uses
-    Bun.hash while the SDK under Node.js uses simpleHash — for paths that
-    exceed MAX_SANITIZED_LENGTH, these produce different directory suffixes.
-    This function falls back to prefix-based scanning when the exact match
-    doesn't exist.
+    ``verify_cwd`` is set for directories the CLI named with the lossy
+    :func:`_sanitize_path`: a session there belongs to ``project_path`` only
+    if :func:`_session_cwd_matches` accepts its head.
     """
-    exact = _get_project_dir(project_path)
-    if exact.is_dir():
-        return exact
 
-    # Exact match failed — for short paths this means no sessions exist.
-    # For long paths, try prefix matching to handle hash mismatches.
+    path: Path
+    project_path: str
+    verify_cwd: bool
+
+
+def _legacy_project_dir_matches(name: str, sanitized: str) -> bool:
+    """Whether ``name`` is a CLI directory name for a path sanitizing to
+    ``sanitized``.
+
+    Long paths (> MAX_SANITIZED_LENGTH) also match on the truncated prefix:
+    the CLI hashes the suffix with Bun.hash, which the SDK cannot reproduce.
+    """
+    return name == sanitized or (
+        len(sanitized) > MAX_SANITIZED_LENGTH
+        and name.startswith(sanitized[:MAX_SANITIZED_LENGTH] + "-")
+    )
+
+
+def _project_dirs(project_path: str) -> list[_ProjectDir]:
+    """Existing directories that may hold sessions for ``project_path``.
+
+    The SDK's own directory (named by :func:`_project_key`) comes first.
+    Directories the CLI created follow, flagged for per-session ``cwd``
+    verification since their names are shared by distinct paths.
+    """
+    result: list[_ProjectDir] = []
+    own = _get_project_dir(project_path)
+    if own.is_dir():
+        result.append(_ProjectDir(own, project_path, False))
+
     sanitized = _sanitize_path(project_path)
-    if len(sanitized) <= MAX_SANITIZED_LENGTH:
+    projects_dir = _get_projects_dir()
+    exact = projects_dir / sanitized
+    if exact.is_dir():
+        result.append(_ProjectDir(exact, project_path, True))
+    if len(sanitized) > MAX_SANITIZED_LENGTH:
+        try:
+            for entry in projects_dir.iterdir():
+                if (
+                    entry.name != sanitized
+                    and _legacy_project_dir_matches(entry.name, sanitized)
+                    and entry.is_dir()
+                ):
+                    result.append(_ProjectDir(entry, project_path, True))
+        except OSError:
+            pass
+    return result
+
+
+def _scoped_project_dirs(canonical: str) -> Iterator[_ProjectDir]:
+    """:func:`_project_dirs` for ``canonical``, then for its other git
+    worktrees. Lazy, so worktrees are only listed if the caller keeps going.
+    """
+    yield from _project_dirs(canonical)
+    try:
+        worktree_paths = _get_worktree_paths(canonical)
+    except Exception:
+        worktree_paths = []
+    for wt in worktree_paths:
+        if wt == canonical:
+            continue
+        yield from _project_dirs(wt)
+
+
+def _recorded_cwd(head: str) -> str | None:
+    """The working directory a transcript was recorded in: the first
+    top-level ``cwd`` among its leading lines."""
+    for line in head.split("\n"):
+        if '"cwd"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            # Truncated by the head read. The CLI writes ``cwd`` ahead of the
+            # message body, so the first raw match is the top-level field.
+            return _extract_json_string_field(line, "cwd")
+        if isinstance(entry, dict):
+            cwd = entry.get("cwd")
+            if isinstance(cwd, str):
+                return cwd
+    return None
+
+
+def _session_cwd_matches(head: str, project_paths: Sequence[str]) -> bool:
+    """Whether the transcript whose head is ``head`` was recorded in one of
+    ``project_paths`` (canonical paths). Fails closed without a ``cwd``."""
+    recorded = _recorded_cwd(head)
+    if not recorded:
+        return False
+    canonical = _canonicalize_path(recorded)
+    for project_path in project_paths:
+        if canonical == project_path:
+            return True
+        # Same directory under another spelling (e.g. case on a
+        # case-insensitive filesystem). Both must exist right now.
+        try:
+            if Path(recorded).samefile(project_path):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def _read_session_head(path: Path) -> tuple[os.stat_result, str] | None:
+    """Stat a session file and read its head through one handle.
+
+    Returns ``None`` if the file is missing, unreadable, or empty.
+    """
+    try:
+        with path.open("rb") as f:
+            st = os.fstat(f.fileno())
+            if st.st_size == 0:
+                return None
+            head = f.read(LITE_READ_BUF_SIZE).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return st, head
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return a.st_dev == b.st_dev and a.st_ino == b.st_ino
+
+
+class _SessionFile(NamedTuple):
+    """A session file resolved for a caller.
+
+    ``project_key`` is the :class:`SessionStore` key of the project the file
+    was attributed to. ``stat`` records the file's identity at resolution;
+    callers that reopen ``path`` compare against it with :func:`_same_file`.
+    """
+
+    path: Path
+    project_key: str
+    stat: os.stat_result
+
+
+def _resolve_session_file(
+    session_id: str, directory: str | None
+) -> _SessionFile | None:
+    """Resolve a session's JSONL file.
+
+    With ``directory``, looks in that project's directories and its git
+    worktrees', accepting a file in a CLI-named directory only if its
+    recorded ``cwd`` is the project path. Without, searches every project
+    directory. Returns the first non-empty match.
+    """
+    file_name = f"{session_id}.jsonl"
+
+    if directory:
+        for candidate in _scoped_project_dirs(_canonicalize_path(directory)):
+            opened = _read_session_head(candidate.path / file_name)
+            if opened is None:
+                continue
+            st, head = opened
+            if candidate.verify_cwd and not _session_cwd_matches(
+                head, [candidate.project_path]
+            ):
+                continue
+            return _SessionFile(
+                candidate.path / file_name,
+                _project_key(candidate.project_path),
+                st,
+            )
         return None
 
-    prefix = sanitized[:MAX_SANITIZED_LENGTH]
     projects_dir = _get_projects_dir()
     try:
-        for entry in projects_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith(prefix + "-"):
-                return entry
+        dirents = list(projects_dir.iterdir())
     except OSError:
-        pass
+        return None
+
+    for entry in dirents:
+        if not entry.is_dir():
+            continue
+        opened = _read_session_head(entry / file_name)
+        if opened is None:
+            continue
+        st, head = opened
+        if _PROJECT_KEY_RE.match(entry.name):
+            project_key = entry.name
+        else:
+            # A CLI-named directory is not a project identity; key the
+            # session by the directory it was recorded in.
+            recorded = _recorded_cwd(head)
+            project_key = (
+                _project_key(_canonicalize_path(recorded)) if recorded else entry.name
+            )
+        return _SessionFile(entry / file_name, project_key, st)
+
     return None
 
 
@@ -517,12 +720,16 @@ def _parse_session_info_from_lite(
 
 
 def _read_sessions_from_dir(
-    project_dir: Path, project_path: str | None = None
+    project_dir: Path,
+    project_path: str | None = None,
+    verify_paths: Sequence[str] | None = None,
 ) -> list[SDKSessionInfo]:
     """Reads session files from a single project directory.
 
     Each file gets a stat + head/tail read. Filters out sidechain sessions
-    and metadata-only sessions (no title/summary/prompt).
+    and metadata-only sessions (no title/summary/prompt). With
+    ``verify_paths``, also drops sessions not recorded in one of those
+    paths (see :func:`_session_cwd_matches`).
     """
     try:
         entries = list(project_dir.iterdir())
@@ -542,12 +749,24 @@ def _read_sessions_from_dir(
         lite = _read_session_lite(entry)
         if lite is None:
             continue
+        if verify_paths is not None and not _session_cwd_matches(
+            lite.head, verify_paths
+        ):
+            continue
 
         info = _parse_session_info_from_lite(session_id, lite, project_path)
         if info is not None:
             results.append(info)
 
     return results
+
+
+def _read_sessions_from_project_dir(candidate: _ProjectDir) -> list[SDKSessionInfo]:
+    return _read_sessions_from_dir(
+        candidate.path,
+        candidate.project_path,
+        [candidate.project_path] if candidate.verify_cwd else None,
+    )
 
 
 def _deduplicate_by_session_id(
@@ -596,68 +815,61 @@ def _list_sessions_for_project(
     # No worktrees (or git not available / scanning disabled) —
     # just scan the single project dir
     if len(worktree_paths) <= 1:
-        project_dir = _find_project_dir(canonical_dir)
-        if project_dir is None:
-            return []
-        sessions = _read_sessions_from_dir(project_dir, canonical_dir)
-        return _apply_sort_limit_offset(sessions, limit, offset)
+        return _apply_sort_limit_offset(
+            _list_project_dirs_sessions(_project_dirs(canonical_dir)), limit, offset
+        )
 
     # Worktree-aware scanning: find all project dirs matching any worktree
     projects_dir = _get_projects_dir()
     case_insensitive = sys.platform == "win32"
 
-    # Sort worktree paths by sanitized prefix length (longest first) so
-    # more specific matches take priority over shorter ones
-    indexed = []
-    for wt in worktree_paths:
-        sanitized = _sanitize_path(wt)
-        prefix = sanitized.lower() if case_insensitive else sanitized
-        indexed.append((wt, prefix))
-    indexed.sort(key=lambda x: len(x[1]), reverse=True)
+    def _fold(name: str) -> str:
+        return name.lower() if case_insensitive else name
 
     try:
         all_dirents = [e for e in projects_dir.iterdir() if e.is_dir()]
     except OSError:
-        # Fall back to single project dir
-        project_dir = _find_project_dir(canonical_dir)
-        if project_dir is None:
-            return _apply_sort_limit_offset([], limit, offset)
-        sessions = _read_sessions_from_dir(project_dir, canonical_dir)
-        return _apply_sort_limit_offset(sessions, limit, offset)
-
-    all_sessions: list[SDKSessionInfo] = []
-    seen_dirs: set[str] = set()
+        return _apply_sort_limit_offset(
+            _list_project_dirs_sessions(_project_dirs(canonical_dir)), limit, offset
+        )
 
     # Always include the user's actual directory (handles subdirectories
     # like /repo/packages/my-app that won't match worktree root prefixes)
-    canonical_project_dir = _find_project_dir(canonical_dir)
-    if canonical_project_dir is not None:
-        dir_base = canonical_project_dir.name
-        seen_dirs.add(dir_base.lower() if case_insensitive else dir_base)
-        sessions = _read_sessions_from_dir(canonical_project_dir, canonical_dir)
-        all_sessions.extend(sessions)
+    project_paths = [canonical_dir] + [
+        wt for wt in worktree_paths if wt != canonical_dir
+    ]
+    own_names = {_fold(_project_key(p)): p for p in project_paths}
+    legacy_names = [(p, _fold(_sanitize_path(p))) for p in project_paths]
 
+    all_sessions: list[SDKSessionInfo] = []
     for entry in all_dirents:
-        dir_name = entry.name.lower() if case_insensitive else entry.name
-        if dir_name in seen_dirs:
+        dir_name = _fold(entry.name)
+        own_path = own_names.get(dir_name)
+        if own_path is not None:
+            all_sessions.extend(_read_sessions_from_dir(entry, own_path))
             continue
-
-        for wt_path, prefix in indexed:
-            # Only use startswith for truncated paths (>MAX_SANITIZED_LENGTH)
-            # where a hash suffix follows. For short paths, require exact match
-            # to avoid /root/project matching /root/project-foo.
-            is_match = dir_name == prefix or (
-                len(prefix) >= MAX_SANITIZED_LENGTH
-                and dir_name.startswith(prefix + "-")
-            )
-            if is_match:
-                seen_dirs.add(dir_name)
-                sessions = _read_sessions_from_dir(entry, wt_path)
-                all_sessions.extend(sessions)
-                break
+        # A CLI-named directory can be shared by several of these paths and
+        # by unrelated ones; each session must have been recorded in one of
+        # the paths whose name matched.
+        matched = [
+            p
+            for p, sanitized in legacy_names
+            if _legacy_project_dir_matches(dir_name, sanitized)
+        ]
+        if matched:
+            all_sessions.extend(_read_sessions_from_dir(entry, matched[0], matched))
 
     deduped = _deduplicate_by_session_id(all_sessions)
     return _apply_sort_limit_offset(deduped, limit, offset)
+
+
+def _list_project_dirs_sessions(
+    candidates: list[_ProjectDir],
+) -> list[SDKSessionInfo]:
+    sessions: list[SDKSessionInfo] = []
+    for candidate in candidates:
+        sessions.extend(_read_sessions_from_project_dir(candidate))
+    return _deduplicate_by_session_id(sessions)
 
 
 def _list_all_sessions(limit: int | None, offset: int) -> list[SDKSessionInfo]:
@@ -781,27 +993,17 @@ def get_session_info(
     file_name = f"{uuid}.jsonl"
 
     if directory:
-        canonical = _canonicalize_path(directory)
-        project_dir = _find_project_dir(canonical)
-        if project_dir is not None:
-            lite = _read_session_lite(project_dir / file_name)
-            if lite is not None:
-                return _parse_session_info_from_lite(uuid, lite, canonical)
-
         # Worktree fallback — matches get_session_messages semantics.
         # Sessions may live under a different worktree root.
-        try:
-            worktree_paths = _get_worktree_paths(canonical)
-        except Exception:
-            worktree_paths = []
-        for wt in worktree_paths:
-            if wt == canonical:
+        for candidate in _scoped_project_dirs(_canonicalize_path(directory)):
+            lite = _read_session_lite(candidate.path / file_name)
+            if lite is None:
                 continue
-            wt_project_dir = _find_project_dir(wt)
-            if wt_project_dir is not None:
-                lite = _read_session_lite(wt_project_dir / file_name)
-                if lite is not None:
-                    return _parse_session_info_from_lite(uuid, lite, wt)
+            if candidate.verify_cwd and not _session_cwd_matches(
+                lite.head, [candidate.project_path]
+            ):
+                continue
+            return _parse_session_info_from_lite(uuid, lite, candidate.project_path)
 
         return None
 
@@ -844,38 +1046,25 @@ def _try_read_session_file(project_dir: Path, file_name: str) -> str | None:
 def _read_session_file(session_id: str, directory: str | None) -> str | None:
     """Finds and reads the session JSONL file.
 
-    If directory is provided, looks in that project directory and its git
-    worktrees (with prefix-fallback for Bun/Node hash mismatches on long
-    paths). Otherwise, searches all project directories.
+    If directory is provided, looks in that project's directories and its
+    git worktrees' (see :func:`_project_dirs`). Otherwise, searches all
+    project directories.
 
     Returns the file content, or None if not found.
     """
     file_name = f"{session_id}.jsonl"
 
     if directory:
-        canonical_dir = _canonicalize_path(directory)
-
-        # Try the exact/prefix-matched project directory first
-        project_dir = _find_project_dir(canonical_dir)
-        if project_dir is not None:
-            content = _try_read_session_file(project_dir, file_name)
-            if content:
-                return content
-
-        # Try worktree paths — sessions may live under a different worktree root
-        try:
-            worktree_paths = _get_worktree_paths(canonical_dir)
-        except Exception:
-            worktree_paths = []
-
-        for wt in worktree_paths:
-            if wt == canonical_dir:
-                continue  # already tried above
-            wt_project_dir = _find_project_dir(wt)
-            if wt_project_dir is not None:
-                content = _try_read_session_file(wt_project_dir, file_name)
-                if content:
-                    return content
+        for candidate in _scoped_project_dirs(_canonicalize_path(directory)):
+            content = _try_read_session_file(candidate.path, file_name)
+            if not content:
+                continue
+            # Checked on the content being returned, not a separate read.
+            if candidate.verify_cwd and not _session_cwd_matches(
+                content[:LITE_READ_BUF_SIZE], [candidate.project_path]
+            ):
+                continue
+            return content
 
         return None
 
@@ -1136,66 +1325,6 @@ def _entries_to_session_messages(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_session_file_path(session_id: str, directory: str | None) -> Path | None:
-    """Resolves the on-disk path of a session JSONL file.
-
-    Directory resolution mirrors ``_read_session_file``: when ``directory``
-    is provided, looks in that project directory and its git worktrees;
-    otherwise searches all project directories. Returns the path of the
-    first non-empty match, or ``None`` if not found.
-    """
-    file_name = f"{session_id}.jsonl"
-
-    def _stat_candidate(project_dir: Path) -> Path | None:
-        candidate = project_dir / file_name
-        try:
-            if candidate.stat().st_size > 0:
-                return candidate
-        except OSError:
-            pass
-        return None
-
-    if directory:
-        canonical_dir = _canonicalize_path(directory)
-
-        project_dir = _find_project_dir(canonical_dir)
-        if project_dir is not None:
-            found = _stat_candidate(project_dir)
-            if found is not None:
-                return found
-
-        try:
-            worktree_paths = _get_worktree_paths(canonical_dir)
-        except Exception:
-            worktree_paths = []
-
-        for wt in worktree_paths:
-            if wt == canonical_dir:
-                continue
-            wt_project_dir = _find_project_dir(wt)
-            if wt_project_dir is not None:
-                found = _stat_candidate(wt_project_dir)
-                if found is not None:
-                    return found
-
-        return None
-
-    projects_dir = _get_projects_dir()
-    try:
-        dirents = list(projects_dir.iterdir())
-    except OSError:
-        return None
-
-    for entry in dirents:
-        if not entry.is_dir():
-            continue
-        found = _stat_candidate(entry)
-        if found is not None:
-            return found
-
-    return None
-
-
 def _resolve_subagents_dir(session_id: str, directory: str | None) -> Path | None:
     """Resolves the subagents directory for a given session.
 
@@ -1204,11 +1333,11 @@ def _resolve_subagents_dir(session_id: str, directory: str | None) -> Path | Non
 
     Returns ``None`` if the session cannot be found.
     """
-    resolved = _resolve_session_file_path(session_id, directory)
+    resolved = _resolve_session_file(session_id, directory)
     if resolved is None:
         return None
     # Strip the .jsonl suffix to derive the session directory.
-    session_dir = resolved.with_suffix("")
+    session_dir = resolved.path.with_suffix("")
     return session_dir / "subagents"
 
 
@@ -1513,14 +1642,13 @@ def _entries_to_subagent_messages(
 def project_key_for_directory(directory: str | Path | None = None) -> str:
     """Derive the :class:`SessionStore` ``project_key`` for a directory.
 
-    Defaults to the current working directory. Uses the same realpath + NFC
-    normalization + djb2-hashed sanitization the CLI uses for project
-    directory names, so keys match between local-disk transcripts and
-    store-mirrored transcripts even on filesystems that decompose Unicode
-    (macOS HFS+).
+    Defaults to the current working directory. The path is canonicalized
+    (realpath + NFC, so keys are stable on filesystems that decompose
+    Unicode such as macOS HFS+) and keyed by its SHA-256, so distinct
+    directories never share a key. The readable prefix is display only.
     """
     abs_path = _canonicalize_path(str(directory) if directory is not None else ".")
-    return _sanitize_path(abs_path)
+    return _project_key(abs_path)
 
 
 def _entries_to_jsonl(entries: list[Any]) -> str:
@@ -1720,7 +1848,7 @@ async def list_sessions_from_store(
         result.
     """
     project_path = _canonicalize_path(str(directory) if directory is not None else ".")
-    project_key = _sanitize_path(project_path)
+    project_key = _project_key(project_path)
     has_list_sessions = _store_implements(session_store, "list_sessions")
 
     # Fast path: if the store maintains incremental summaries, fetch them in

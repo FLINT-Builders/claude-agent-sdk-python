@@ -22,6 +22,7 @@ from claude_agent_sdk import (
     MirrorErrorMessage,
     ResultMessage,
     SessionKey,
+    project_key_for_directory,
     query,
 )
 from claude_agent_sdk._internal.query import Query
@@ -693,7 +694,10 @@ class TestReceiveLoopFramePeeling:
             # Both frames flushed (coalesced) to the store before result yields
             assert len(store.append_calls) == 1
             key, entries = store.append_calls[0]
-            assert key == {"project_key": "myproj", "session_id": "mysess"}
+            assert key == {
+                "project_key": project_key_for_directory(),
+                "session_id": "mysess",
+            }
             assert entries == [
                 {"type": "user", "uuid": "u1"},
                 {"type": "user", "uuid": "u1"},
@@ -786,7 +790,10 @@ class TestReceiveLoopFramePeeling:
             # Late frame must have been flushed via the finally-block flush.
             assert len(store.append_calls) == 1
             key, entries = store.append_calls[0]
-            assert key == {"project_key": "late", "session_id": "sess"}
+            assert key == {
+                "project_key": project_key_for_directory(),
+                "session_id": "sess",
+            }
             assert entries == [{"type": "user", "uuid": "late-u1"}]
 
         anyio.run(_test)
@@ -931,7 +938,10 @@ class TestReceiveLoopFramePeeling:
             assert len(mirror_errors) == 1
             assert mirror_errors[0].subtype == "mirror_error"
             assert "disk full" in mirror_errors[0].error
-            assert mirror_errors[0].key == {"project_key": "proj", "session_id": "sess"}
+            assert mirror_errors[0].key == {
+                "project_key": project_key_for_directory(),
+                "session_id": "sess",
+            }
             # Non-fatal: result still yielded
             assert any(isinstance(m, ResultMessage) for m in messages)
 

@@ -25,6 +25,10 @@ from claude_agent_sdk import (
     project_key_for_directory,
 )
 from claude_agent_sdk._internal.session_resume import materialize_resume_session
+from claude_agent_sdk._internal.sessions import (
+    _canonicalize_path,
+    _sanitize_path,
+)
 from claude_agent_sdk._internal.transcript_mirror_batcher import TranscriptMirrorBatcher
 from claude_agent_sdk.testing import run_session_store_conformance
 
@@ -287,6 +291,7 @@ class TestRoundTrip:
         cwd = tmp_path / "project"
         cwd.mkdir()
         project_key = project_key_for_directory(cwd)
+        cli_dir = _sanitize_path(_canonicalize_path(str(cwd)))
 
         # One fake Redis server shared between the batcher (writer) and resume
         # (reader) so the round-trip is observable.
@@ -334,14 +339,14 @@ class TestRoundTrip:
         try:
             assert result.resume_session_id == SESSION_ID
             jsonl = (
-                result.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+                result.config_dir / "projects" / cli_dir / f"{SESSION_ID}.jsonl"
             ).read_text()
             lines = [json.loads(line) for line in jsonl.splitlines()]
             assert lines == main_entries
             sub_jsonl = (
                 result.config_dir
                 / "projects"
-                / project_key
+                / cli_dir
                 / SESSION_ID
                 / "subagents"
                 / "agent-1.jsonl"

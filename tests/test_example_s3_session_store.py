@@ -37,6 +37,10 @@ from claude_agent_sdk import ClaudeAgentOptions, project_key_for_directory  # no
 from claude_agent_sdk._internal.session_resume import (  # noqa: E402
     materialize_resume_session,
 )
+from claude_agent_sdk._internal.sessions import (  # noqa: E402
+    _canonicalize_path,
+    _sanitize_path,
+)
 from claude_agent_sdk._internal.transcript_mirror_batcher import (  # noqa: E402
     TranscriptMirrorBatcher,
 )
@@ -533,6 +537,7 @@ async def test_materialize_round_trip(
     cwd.mkdir()
     store = _make_store(s3_client)
     project_key = project_key_for_directory(cwd)
+    cli_dir = _sanitize_path(_canonicalize_path(str(cwd)))
 
     seeded: list[dict[str, Any]] = []
     parent: str | None = None
@@ -559,13 +564,13 @@ async def test_materialize_round_trip(
     assert result is not None
     try:
         assert result.resume_session_id == SESSION_ID
-        main = result.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+        main = result.config_dir / "projects" / cli_dir / f"{SESSION_ID}.jsonl"
         lines = [json.loads(ln) for ln in main.read_text().splitlines() if ln]
         assert lines == seeded
         sub = (
             result.config_dir
             / "projects"
-            / project_key
+            / cli_dir
             / SESSION_ID
             / "subagents"
             / "agent-1.jsonl"

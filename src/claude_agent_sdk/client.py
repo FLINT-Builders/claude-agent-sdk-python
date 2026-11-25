@@ -226,6 +226,7 @@ class ClaudeSDKClient:
                     env=self.options.env,
                     on_error=_on_mirror_error,
                     flush_mode=self.options.session_store_flush,
+                    cwd=self.options.cwd,
                 )
             )
 

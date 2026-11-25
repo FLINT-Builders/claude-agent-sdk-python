@@ -43,6 +43,10 @@ from claude_agent_sdk import (  # noqa: E402
 from claude_agent_sdk._internal.session_resume import (  # noqa: E402
     materialize_resume_session,
 )
+from claude_agent_sdk._internal.sessions import (  # noqa: E402
+    _canonicalize_path,
+    _sanitize_path,
+)
 from claude_agent_sdk._internal.transcript_mirror_batcher import (  # noqa: E402
     TranscriptMirrorBatcher,
 )
@@ -127,6 +131,7 @@ class TestLiveRoundTrip:
         cwd = tmp_path / "project"
         cwd.mkdir()
         project_key = project_key_for_directory(cwd)
+        cli_dir = _sanitize_path(_canonicalize_path(str(cwd)))
         store = _make_store(live_prefix)
 
         errors: list[tuple] = []
@@ -162,13 +167,13 @@ class TestLiveRoundTrip:
         try:
             assert result.resume_session_id == SESSION_ID
             jsonl = (
-                result.config_dir / "projects" / project_key / f"{SESSION_ID}.jsonl"
+                result.config_dir / "projects" / cli_dir / f"{SESSION_ID}.jsonl"
             ).read_text()
             assert [json.loads(line) for line in jsonl.splitlines()] == main_entries
             sub_jsonl = (
                 result.config_dir
                 / "projects"
-                / project_key
+                / cli_dir
                 / SESSION_ID
                 / "subagents"
                 / "agent-1.jsonl"
