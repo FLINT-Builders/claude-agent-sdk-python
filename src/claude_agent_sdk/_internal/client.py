@@ -1,6 +1,5 @@
 """Internal client implementation."""
 
-import json
 import os
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from dataclasses import asdict
@@ -13,7 +12,7 @@ from ..types import (
     _hooks_to_internal_format,
 )
 from .message_parser import parse_message
-from .query import Query, stamp_user_message
+from .query import Query, encode_user_message
 from .session_resume import (
     MaterializedResume,
     apply_materialized_options,
@@ -187,12 +186,9 @@ class InternalClient:
                     "parent_tool_use_id": None,
                 }
                 await chosen_transport.write(
-                    json.dumps(
-                        stamp_user_message(
-                            user_message, configured_options.verbatim_prompts
-                        )
+                    encode_user_message(
+                        user_message, configured_options.verbatim_prompts
                     )
-                    + "\n"
                 )
                 query.spawn_task(query.wait_for_result_and_end_input())
             elif isinstance(prompt, AsyncIterable):

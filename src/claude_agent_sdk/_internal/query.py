@@ -99,18 +99,37 @@ def _convert_hook_output_for_cli(hook_output: dict[str, Any]) -> dict[str, Any]:
     return converted
 
 
-def stamp_user_message(
-    message: dict[str, Any], verbatim_prompts: bool
-) -> dict[str, Any]:
-    """Apply ``ClaudeAgentOptions.verbatim_prompts`` to an outgoing user message.
+def encode_user_message(
+    message: dict[str, Any],
+    verbatim_prompts: bool,
+    default_session_id: str | None = None,
+) -> str:
+    """Encode an outgoing prompt message as one NDJSON line for the CLI's stdin.
 
-    Returns ``message`` unchanged when the option is off; otherwise a copy with
-    ``client_composed`` set to ``True`` (overwriting any caller-supplied value)
-    so the CLI delivers the text as written.
+    Stdin also carries control frames, so anything other than a user message
+    is refused with ``ValueError``. The type check runs on a plain dict decoded
+    from the message's own serialization, and that same dict is what gets
+    encoded, so the check always describes the bytes written even when the
+    caller's mapping reports different values than it serializes.
+
+    ``default_session_id`` fills ``session_id`` when the message has none.
+    With ``ClaudeAgentOptions.verbatim_prompts`` on, ``client_composed`` is set
+    to ``True`` (overwriting any caller-supplied value) so the CLI delivers the
+    text as written. The caller's message is never mutated.
     """
-    if not verbatim_prompts:
-        return message
-    return {**message, "client_composed": True}
+    frame = json.loads(json.dumps(message))
+    if not isinstance(frame, dict) or frame.get("type") != "user":
+        got = frame.get("type") if isinstance(frame, dict) else type(frame).__name__
+        raise ValueError(
+            "Streamed prompt items must be user messages with type 'user'; "
+            f"got {got!r}. Use the client's control methods (e.g. "
+            "set_permission_mode) for control operations."
+        )
+    if default_session_id is not None and "session_id" not in frame:
+        frame["session_id"] = default_session_id
+    if verbatim_prompts:
+        frame["client_composed"] = True
+    return json.dumps(frame) + "\n"
 
 
 class Query:
@@ -898,8 +917,7 @@ class Query:
                 if self._closed:
                     break
                 await self.transport.write(
-                    json.dumps(stamp_user_message(message, self._verbatim_prompts))
-                    + "\n"
+                    encode_user_message(message, self._verbatim_prompts)
                 )
                 written += 1
         except Exception as e:
