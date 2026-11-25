@@ -101,6 +101,83 @@ def _simple_hash(s: str) -> str:
     return "".join(reversed(out))
 
 
+_U64_MASK = 0xFFFFFFFFFFFFFFFF
+_WYHASH_SECRET = (
+    0xA0761D6478BD642F,
+    0xE7037ED1A0B428DB,
+    0x8EBC6AF09C88C6E3,
+    0x589965CC75374CC3,
+)
+
+
+def _wyhash_mum(a: int, b: int) -> tuple[int, int]:
+    x = a * b
+    return x & _U64_MASK, x >> 64
+
+
+def _wyhash_mix(a: int, b: int) -> int:
+    lo, hi = _wyhash_mum(a, b)
+    return lo ^ hi
+
+
+def _wyhash(data: bytes) -> int:
+    """Zig ``std.hash.Wyhash.hash(0, data)``, which backs ``Bun.hash``."""
+
+    def read(i: int, n: int) -> int:
+        return int.from_bytes(data[i : i + n], "little")
+
+    n = len(data)
+    secret = _WYHASH_SECRET
+    s0 = _wyhash_mix(secret[0], secret[1])
+    s1 = s2 = s0
+    if n <= 16:
+        if n >= 4:
+            quarter = (n >> 3) << 2
+            end = n - 4
+            a = (read(0, 4) << 32) | read(quarter, 4)
+            b = (read(end, 4) << 32) | read(end - quarter, 4)
+        elif n > 0:
+            a = (data[0] << 16) | (data[n >> 1] << 8) | data[n - 1]
+            b = 0
+        else:
+            a = b = 0
+    else:
+        i = 0
+        if n >= 48:
+            while i + 48 < n:
+                s0 = _wyhash_mix(read(i, 8) ^ secret[1], read(i + 8, 8) ^ s0)
+                s1 = _wyhash_mix(read(i + 16, 8) ^ secret[2], read(i + 24, 8) ^ s1)
+                s2 = _wyhash_mix(read(i + 32, 8) ^ secret[3], read(i + 40, 8) ^ s2)
+                i += 48
+            s0 ^= s1 ^ s2
+        while i + 16 < n:
+            s0 = _wyhash_mix(read(i, 8) ^ secret[1], read(i + 8, 8) ^ s0)
+            i += 16
+        a = read(n - 16, 8)
+        b = read(n - 8, 8)
+    a, b = _wyhash_mum(a ^ secret[1], b ^ s0)
+    return _wyhash_mix(a ^ secret[0] ^ n, b ^ secret[1])
+
+
+def _to_base36(n: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = []
+    while True:
+        out.append(digits[n % 36])
+        n //= 36
+        if n == 0:
+            return "".join(reversed(out))
+
+
+def _bun_hash(s: str) -> str | None:
+    """``Bun.hash(s).toString(36)``, or None if ``s`` is not encodable as UTF-8."""
+    try:
+        data = s.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return _to_base36(_wyhash(data))
+
+
 def _sanitize_path(name: str) -> str:
     """Makes a string safe for use as a directory name.
 
@@ -154,33 +231,33 @@ def _canonicalize_path(d: str) -> str:
         return unicodedata.normalize("NFC", d)
 
 
-def _find_project_dir(project_path: str) -> Path | None:
-    """Finds the project directory for a given path.
+def _project_dir_names(project_path: str) -> list[str]:
+    """Returns the exact project folder names the CLI may write for a path.
 
-    Tolerates hash mismatches for long paths (>200 chars). The CLI uses
-    Bun.hash while the SDK under Node.js uses simpleHash — for paths that
-    exceed MAX_SANITIZED_LENGTH, these produce different directory suffixes.
-    This function falls back to prefix-based scanning when the exact match
-    doesn't exist.
+    Paths whose sanitized form exceeds MAX_SANITIZED_LENGTH are truncated and
+    suffixed with a hash of the full path. Current CLI builds use simpleHash
+    (as ``_sanitize_path`` does); older native builds used ``Bun.hash``. Every
+    name is derived from the full path: a folder that merely shares the
+    truncated prefix belongs to a different project and must never be used.
     """
-    exact = _get_project_dir(project_path)
-    if exact.is_dir():
-        return exact
-
-    # Exact match failed — for short paths this means no sessions exist.
-    # For long paths, try prefix matching to handle hash mismatches.
-    sanitized = _sanitize_path(project_path)
+    sanitized = _SANITIZE_RE.sub("-", project_path)
     if len(sanitized) <= MAX_SANITIZED_LENGTH:
-        return None
-
+        return [sanitized]
     prefix = sanitized[:MAX_SANITIZED_LENGTH]
+    names = [f"{prefix}-{_simple_hash(project_path)}"]
+    bun_suffix = _bun_hash(project_path)
+    if bun_suffix is not None:
+        names.append(f"{prefix}-{bun_suffix}")
+    return names
+
+
+def _find_project_dir(project_path: str) -> Path | None:
+    """Finds the project directory for a given path, by exact name only."""
     projects_dir = _get_projects_dir()
-    try:
-        for entry in projects_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith(prefix + "-"):
-                return entry
-    except OSError:
-        pass
+    for name in _project_dir_names(project_path):
+        candidate = projects_dir / name
+        if candidate.is_dir():
+            return candidate
     return None
 
 
@@ -606,14 +683,11 @@ def _list_sessions_for_project(
     projects_dir = _get_projects_dir()
     case_insensitive = sys.platform == "win32"
 
-    # Sort worktree paths by sanitized prefix length (longest first) so
-    # more specific matches take priority over shorter ones
-    indexed = []
+    worktree_by_dir_name: dict[str, str] = {}
     for wt in worktree_paths:
-        sanitized = _sanitize_path(wt)
-        prefix = sanitized.lower() if case_insensitive else sanitized
-        indexed.append((wt, prefix))
-    indexed.sort(key=lambda x: len(x[1]), reverse=True)
+        for name in _project_dir_names(wt):
+            key = name.lower() if case_insensitive else name
+            worktree_by_dir_name.setdefault(key, wt)
 
     try:
         all_dirents = [e for e in projects_dir.iterdir() if e.is_dir()]
@@ -642,19 +716,11 @@ def _list_sessions_for_project(
         if dir_name in seen_dirs:
             continue
 
-        for wt_path, prefix in indexed:
-            # Only use startswith for truncated paths (>MAX_SANITIZED_LENGTH)
-            # where a hash suffix follows. For short paths, require exact match
-            # to avoid /root/project matching /root/project-foo.
-            is_match = dir_name == prefix or (
-                len(prefix) >= MAX_SANITIZED_LENGTH
-                and dir_name.startswith(prefix + "-")
-            )
-            if is_match:
-                seen_dirs.add(dir_name)
-                sessions = _read_sessions_from_dir(entry, wt_path)
-                all_sessions.extend(sessions)
-                break
+        wt_path = worktree_by_dir_name.get(dir_name)
+        if wt_path is not None:
+            seen_dirs.add(dir_name)
+            sessions = _read_sessions_from_dir(entry, wt_path)
+            all_sessions.extend(sessions)
 
     deduped = _deduplicate_by_session_id(all_sessions)
     return _apply_sort_limit_offset(deduped, limit, offset)
@@ -845,8 +911,7 @@ def _read_session_file(session_id: str, directory: str | None) -> str | None:
     """Finds and reads the session JSONL file.
 
     If directory is provided, looks in that project directory and its git
-    worktrees (with prefix-fallback for Bun/Node hash mismatches on long
-    paths). Otherwise, searches all project directories.
+    worktrees. Otherwise, searches all project directories.
 
     Returns the file content, or None if not found.
     """
@@ -855,7 +920,7 @@ def _read_session_file(session_id: str, directory: str | None) -> str | None:
     if directory:
         canonical_dir = _canonicalize_path(directory)
 
-        # Try the exact/prefix-matched project directory first
+        # Try the project directory first
         project_dir = _find_project_dir(canonical_dir)
         if project_dir is not None:
             content = _try_read_session_file(project_dir, file_name)
