@@ -2328,11 +2328,12 @@ class TestSubprocessCLITransport:
 
                 await transport._check_claude_version()
 
-                # logger.warning should be called with version and CLI path
-                mock_logger.warning.assert_called_once()
-                args, _ = mock_logger.warning.call_args
-                assert args[1] == "1.0.0"
-                assert args[2] == DEFAULT_CLI_PATH
+                # Both the minimum-version and the client_composed warnings
+                # name the version and CLI path.
+                assert mock_logger.warning.call_count == 2
+                for call in mock_logger.warning.call_args_list:
+                    assert call.args[1] == "1.0.0"
+                    assert call.args[2] == DEFAULT_CLI_PATH
 
                 # print should NOT be called (no duplicate output)
                 mock_print.assert_not_called()

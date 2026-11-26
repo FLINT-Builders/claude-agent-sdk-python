@@ -2,12 +2,15 @@
 
 Claude Code expands an ``@/absolute/path`` token in prompt text into the
 contents of that file, outside the working directory and without a tool call.
-``verbatim_prompts=True`` delivers the prompt as written instead. These tests
-plant a random marker in a temp file and check whether the model can see it.
+The SDK marks such prompts ``client_composed`` by default, and
+``verbatim_prompts=True`` marks every prompt. These tests plant a random marker
+in a temp file and check whether the model can see it.
 """
 
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,16 +81,39 @@ async def _reply_via_client(prompt: str, options: ClaudeAgentOptions) -> str:
     return reply
 
 
+async def _opted_in_stream(prompt: str) -> AsyncIterator[dict[str, Any]]:
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "client_composed": False,
+    }
+
+
 @pytest.mark.e2e
 @pytest.mark.anyio
-async def test_at_path_is_expanded_by_default(tmp_path):
-    """Control: without the option the CLI reads the @-mentioned file, so the
-    tests below are meaningful."""
+async def test_at_path_is_expanded_on_explicit_opt_in(tmp_path):
+    """Control: a message that explicitly sets ``client_composed: false`` has
+    the CLI read the @-mentioned file, so the tests below are meaningful."""
+    secret, marker = _plant_marker(tmp_path)
+    reply = ""
+    async for message in query(
+        prompt=_opted_in_stream(_prompt(secret)),
+        options=_options(tmp_path / "cwd", verbatim_prompts=False),
+    ):
+        if isinstance(message, AssistantMessage):
+            reply += _text_of(message)
+    assert marker in reply, reply
+
+
+@pytest.mark.e2e
+@pytest.mark.anyio
+async def test_at_path_is_not_expanded_by_default(tmp_path):
     secret, marker = _plant_marker(tmp_path)
     reply = await _reply_via_query(
         _prompt(secret), _options(tmp_path / "cwd", verbatim_prompts=False)
     )
-    assert marker in reply, reply
+    assert marker not in reply, reply
 
 
 @pytest.mark.e2e

@@ -1,8 +1,10 @@
-"""Tests for the verbatim_prompts option.
+"""Tests for the verbatim_prompts option and default ``@`` marking.
 
 With ``verbatim_prompts=True`` every user message the SDK writes carries
 ``client_composed: true``, so the CLI delivers the text as written (no
-``@path`` file-mention expansion, no slash-command dispatch).
+``@path`` file-mention expansion, no slash-command dispatch). With the option
+off, only messages containing an ``@`` sign are marked, unless a streamed
+message explicitly sets ``client_composed: false``.
 """
 
 import json
@@ -13,7 +15,7 @@ import anyio
 import pytest
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, query
-from claude_agent_sdk._internal.query import Query
+from claude_agent_sdk._internal.query import Query, encode_user_message
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 _RESULT = {
@@ -160,7 +162,7 @@ class TestClaudeSDKClient:
     @pytest.mark.parametrize("enabled", [True, False])
     async def test_connect_with_string_prompt(self, enabled):
         async with _ClientHarness(ClaudeAgentOptions(verbatim_prompts=enabled)) as h:
-            await h.client.connect("hello @/etc/hostname")
+            await h.client.connect("hello")
             (frame,) = _user_frames(h.transport)
         assert frame.get("client_composed") is (True if enabled else None)
 
@@ -180,7 +182,7 @@ class TestClaudeSDKClient:
     async def test_query_with_string_prompt(self, enabled):
         async with _ClientHarness(ClaudeAgentOptions(verbatim_prompts=enabled)) as h:
             await h.client.connect()
-            await h.client.query("hello @/etc/hostname")
+            await h.client.query("hello")
             (frame,) = _user_frames(h.transport)
         assert frame.get("client_composed") is (True if enabled else None)
 
@@ -252,6 +254,115 @@ class TestOlderCliWarning:
         logger.warning.assert_not_called()
 
     @pytest.mark.anyio
-    async def test_no_warning_when_option_is_off(self):
+    async def test_warns_when_option_is_off(self):
+        """Default ``@`` marking relies on ``client_composed`` too."""
         logger = await self._check_version(False, b"2.1.100 (Claude Code)")
+        logger.warning.assert_called_once()
+        assert logger.warning.call_args.args[-1] == "2.1.248"
+
+    @pytest.mark.anyio
+    async def test_no_warning_when_option_is_off_and_cli_is_current(self):
+        logger = await self._check_version(False, b"2.1.278 (Claude Code)")
         logger.warning.assert_not_called()
+
+
+class TestDefaultMentionMarking:
+    """With verbatim_prompts off, a message containing ``@`` is still marked."""
+
+    @pytest.mark.anyio
+    async def test_query_string_prompt_with_mention(self):
+        transport = await _run_query("read @/etc/hostname", ClaudeAgentOptions())
+        (frame,) = _user_frames(transport)
+        assert frame["client_composed"] is True
+        assert frame["message"]["content"] == "read @/etc/hostname"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "@../outside/secret.txt",
+            'see @"/tmp/a b.txt"',
+            "line one\n@~/.claude/notes.txt",
+            "\u3002@/etc/hostname",
+            "fullwidth \uff20/etc/hostname",
+            "small \ufe6b/etc/hostname",
+            [
+                {"type": "text", "text": "clean"},
+                {"type": "text", "text": "then @/etc/hostname"},
+            ],
+        ],
+    )
+    async def test_streamed_message_with_mention(self, content):
+        message = _user_message("unused")
+        message["message"]["content"] = content
+        transport = await _run_query(_stream(message), ClaudeAgentOptions())
+        (frame,) = _user_frames(transport)
+        assert frame["client_composed"] is True
+        assert frame["message"]["content"] == content
+        assert "client_composed" not in message
+
+    @pytest.mark.anyio
+    async def test_mention_outside_content_is_marked(self):
+        message = _user_message(
+            "[Pasted text #1]", pasted_content={"1": {"content": "@/etc/hostname"}}
+        )
+        transport = await _run_query(_stream(message), ClaudeAgentOptions())
+        (frame,) = _user_frames(transport)
+        assert frame["client_composed"] is True
+
+    @pytest.mark.anyio
+    async def test_explicit_false_is_the_opt_in(self):
+        transport = await _run_query(
+            _stream(_user_message("read @/etc/hostname", client_composed=False)),
+            ClaudeAgentOptions(),
+        )
+        (frame,) = _user_frames(transport)
+        assert frame["client_composed"] is False
+
+    @pytest.mark.anyio
+    async def test_explicit_none_is_marked(self):
+        transport = await _run_query(
+            _stream(_user_message("read @/etc/hostname", client_composed=None)),
+            ClaudeAgentOptions(),
+        )
+        (frame,) = _user_frames(transport)
+        assert frame["client_composed"] is True
+
+    @pytest.mark.anyio
+    async def test_client_paths_mark_mentions(self):
+        async with _ClientHarness(ClaudeAgentOptions()) as h:
+            await h.client.connect("connect @/etc/hostname")
+            await h.client.query("query @/etc/hostname")
+            await h.client.query(_stream(_user_message("stream @/etc/hostname")))
+            await h.client.query("plain")
+            frames = _user_frames(h.transport)
+        assert [f.get("client_composed") for f in frames] == [True, True, True, None]
+
+    @pytest.mark.anyio
+    async def test_client_connect_stream_marks_mentions(self):
+        async with _ClientHarness(ClaudeAgentOptions()) as h:
+            await h.client.connect(
+                _stream(_user_message("one"), _user_message("two @/etc/hostname"))
+            )
+            await _wait_for_user_frames(h.transport, 2)
+            frames = _user_frames(h.transport)
+        assert [f.get("client_composed") for f in frames] == [None, True]
+
+
+class TestEncodeUserMessage:
+    def test_output_matches_input_plus_mark(self):
+        message = {
+            "type": "user",
+            "message": {"role": "user", "content": "hi @x", "extra": (1, 2.5)},
+            "parent_tool_use_id": None,
+        }
+        encoded = json.loads(encode_user_message(message, False))
+        assert encoded == {**json.loads(json.dumps(message)), "client_composed": True}
+
+    def test_unmarked_output_is_plain_serialization(self):
+        message = _user_message("hello")
+        assert encode_user_message(message, False) == json.dumps(message)
+
+    def test_rejects_unserializable_message(self):
+        with pytest.raises(TypeError):
+            encode_user_message({"type": "user", "message": object()}, False)
