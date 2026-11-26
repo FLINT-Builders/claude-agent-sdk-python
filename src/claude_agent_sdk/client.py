@@ -1,6 +1,5 @@
 """Claude SDK Client for interacting with Claude Code."""
 
-import json
 import os
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import asdict
@@ -134,7 +133,7 @@ class ClaudeSDKClient:
         prompt: str | AsyncIterable[dict[str, Any]] | None,
         actual_prompt: AsyncIterable[dict[str, Any]],
     ) -> None:
-        from ._internal.query import Query, stamp_user_message
+        from ._internal.query import Query, encode_user_message
         from ._internal.session_resume import (
             apply_materialized_options,
             build_mirror_batcher,
@@ -242,7 +241,7 @@ class ClaudeSDKClient:
                 "session_id": "default",
             }
             await self._transport.write(
-                json.dumps(stamp_user_message(message, self._verbatim_prompts)) + "\n"
+                encode_user_message(message, self._verbatim_prompts) + "\n"
             )
         elif prompt is not None and isinstance(prompt, AsyncIterable):
             self._query.spawn_task(self._query.stream_input(prompt))
@@ -272,7 +271,7 @@ class ClaudeSDKClient:
         if not self._query or not self._transport:
             raise CLIConnectionError("Not connected. Call connect() first.")
 
-        from ._internal.query import stamp_user_message
+        from ._internal.query import encode_user_message
 
         # Handle string prompts
         if isinstance(prompt, str):
@@ -283,7 +282,7 @@ class ClaudeSDKClient:
                 "session_id": session_id,
             }
             await self._transport.write(
-                json.dumps(stamp_user_message(message, self._verbatim_prompts)) + "\n"
+                encode_user_message(message, self._verbatim_prompts) + "\n"
             )
         else:
             # Handle AsyncIterable prompts - stream them
@@ -292,7 +291,7 @@ class ClaudeSDKClient:
                 if "session_id" not in msg:
                     msg["session_id"] = session_id
                 await self._transport.write(
-                    json.dumps(stamp_user_message(msg, self._verbatim_prompts)) + "\n"
+                    encode_user_message(msg, self._verbatim_prompts) + "\n"
                 )
 
     async def interrupt(self) -> None:

@@ -99,18 +99,34 @@ def _convert_hook_output_for_cli(hook_output: dict[str, Any]) -> dict[str, Any]:
     return converted
 
 
-def stamp_user_message(
-    message: dict[str, Any], verbatim_prompts: bool
-) -> dict[str, Any]:
-    """Apply ``ClaudeAgentOptions.verbatim_prompts`` to an outgoing user message.
+# Claude Code's turn-start attachment pass reads local files, MCP resources and
+# agent definitions named by ``@`` mentions in the prompt, without a tool call
+# or permission check. The compatibility forms are included so a CLI that
+# normalizes input before matching cannot reopen the mention.
+_MENTION_SIGNS = ("@", "\uff20", "\ufe6b")
 
-    Returns ``message`` unchanged when the option is off; otherwise a copy with
-    ``client_composed`` set to ``True`` (overwriting any caller-supplied value)
-    so the CLI delivers the text as written.
+
+def encode_user_message(message: dict[str, Any], verbatim_prompts: bool) -> str:
+    """Serialize an outgoing user message, marking it ``client_composed`` when needed.
+
+    With ``verbatim_prompts`` every message is marked, overwriting any
+    caller-supplied value. Otherwise a message is marked whenever any string in
+    it contains an ``@`` sign, so the CLI never expands an ``@`` mention the
+    caller did not ask for; a streamed message that explicitly sets
+    ``"client_composed": False`` is the per-message opt-in to expansion.
+
+    The decision and the output are both taken from one private snapshot of
+    ``message``, so the caller's dict is never mutated and a concurrent change
+    to it cannot slip between the check and the write.
     """
-    if not verbatim_prompts:
-        return message
-    return {**message, "client_composed": True}
+    frame: dict[str, Any] = json.loads(json.dumps(message))
+    if verbatim_prompts:
+        frame["client_composed"] = True
+    elif frame.get("client_composed") is not False:
+        text = json.dumps(frame, ensure_ascii=False)
+        if any(sign in text for sign in _MENTION_SIGNS):
+            frame["client_composed"] = True
+    return json.dumps(frame)
 
 
 class Query:
@@ -163,7 +179,9 @@ class Query:
                 subagent text/thinking blocks, not just tool_use/tool_result
             verbatim_prompts: Mark every outgoing user message
                 ``client_composed`` so the CLI delivers it as written (no
-                ``@path`` expansion, no slash-command dispatch)
+                ``@path`` expansion, no slash-command dispatch). When off,
+                only messages containing an ``@`` sign are marked (see
+                ``encode_user_message``)
         """
         self._initialize_timeout = initialize_timeout
         self.transport = transport
@@ -898,8 +916,7 @@ class Query:
                 if self._closed:
                     break
                 await self.transport.write(
-                    json.dumps(stamp_user_message(message, self._verbatim_prompts))
-                    + "\n"
+                    encode_user_message(message, self._verbatim_prompts) + "\n"
                 )
                 written += 1
         except Exception as e:

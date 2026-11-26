@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_BUFFER_SIZE = 1024 * 1024  # 1MB buffer limit
 MINIMUM_CLAUDE_CODE_VERSION = "2.0.0"
 # First Claude Code version that honors `client_composed` on user messages,
-# which `ClaudeAgentOptions.verbatim_prompts` relies on.
+# which `ClaudeAgentOptions.verbatim_prompts` and the SDK's default marking of
+# prompts that contain an `@` sign rely on.
 VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION = "2.1.248"
 
 # cmd.exe metacharacters (plus the quote character cmd.exe uses to toggle
@@ -1188,13 +1189,12 @@ class SubprocessCLITransport(Transport):
                                 "."
                             )
                         ]
-                        if self._options.verbatim_prompts and (
-                            version_parts < verbatim_min_parts
-                        ):
+                        if version_parts < verbatim_min_parts:
                             logger.warning(
-                                "verbatim_prompts is enabled, but Claude Code "
-                                "version %s at %s ignores it: prompts will still "
-                                "have @path mentions expanded and slash commands "
+                                "Claude Code version %s at %s ignores "
+                                "client_composed: @path mentions in prompts will "
+                                "be expanded into file contents even with "
+                                "verbatim_prompts, and slash commands "
                                 "dispatched. Claude Code %s or later is required.",
                                 version,
                                 self._cli_path,

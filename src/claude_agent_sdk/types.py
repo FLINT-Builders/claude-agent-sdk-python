@@ -2199,27 +2199,31 @@ class ClaudeAgentOptions:
     from a streamed prompt, including those passed to
     ``ClaudeSDKClient.query()``) is marked ``client_composed``. Claude Code
     then delivers the text exactly as given: no ``@path`` file-mention
-    expansion and no slash-command dispatch. Use this when the prompt text is
-    assembled from content the end user did not type (prior turns, tool
-    results, third-party text), so an ``@/absolute/path`` inside it cannot make
-    Claude Code read a local file.
+    expansion and no slash-command dispatch.
+
+    When false (the default), the SDK still marks any user message that
+    contains an ``@`` sign anywhere in its content, because Claude Code reads
+    the files named by ``@`` mentions without a tool call or permission check,
+    outside ``cwd`` and regardless of ``tools``. Messages without an ``@`` sign
+    are sent unmarked, so slash commands and per-turn context work as usual
+    for them. To have Claude Code expand the mentions in a particular message,
+    send it as a streamed message with ``"client_composed": False`` set
+    explicitly; the SDK leaves that value alone while this option is off.
 
     While this option is on there is no per-message opt-out: any
-    ``client_composed`` value on a streamed message is overwritten. For
-    per-turn control, leave the option off and set ``"client_composed": True``
-    on individual streamed messages instead.
+    ``client_composed`` value on a streamed message is overwritten.
 
-    On current Claude Code versions a turn delivered this way also skips the
-    turn-start attachment pass as a whole: ``@server:resource`` MCP mentions are
-    not expanded either, and the prompt is sent without the context Claude Code
+    On current Claude Code versions a marked turn also skips the turn-start
+    attachment pass as a whole: ``@server:resource`` MCP mentions are not
+    expanded either, and the prompt is sent without the context Claude Code
     normally attaches alongside it (nested ``CLAUDE.md`` and rules files, skill
     and tool listings, and other per-turn reminders). The pass Claude Code runs
     between tool calls is unaffected, so most of that context arrives after the
     turn's first tool call rather than with the prompt.
 
-    Requires Claude Code 2.1.248 or later; older versions ignore the field, so
-    prompts are still expanded there. The SDK logs a warning when it connects to
-    an older CLI with this option on. The option is read when the session starts.
+    Marking requires Claude Code 2.1.248 or later (the bundled CLI is newer);
+    older versions ignore the field. The SDK logs a warning when it connects to
+    an older CLI. The option is read when the session starts.
     """
 
     fork_session: bool = False
